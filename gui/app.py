@@ -5,7 +5,7 @@
 #   Games  the game profiles (porter profiles --all)
 #   Saves  a ported game's save between the device and the PC (porter saves): the save folders on the device, a fresh export to a folder here, an import of a
 #          folder or .zip (a console's save, or an export)
-import html, os, subprocess, sys, time
+import html, json, os, subprocess, sys, time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -49,10 +49,15 @@ def with_info(field, tip):   # a field with the style's information icon after i
 
 
 # ---------------- Port ----------------
+INST2_TIP = ('Pick a port made earlier, without porting again: its data pack folder (<App>-data).\n'
+             'Press Install on device to push it: the APK beside the pack and the data, on the device; the game\'s dump is not needed.\n'
+             'With a RomFS path below, the app reads the extracted RomFS from the device instead of its own copy.')
+
 class PortTab(QWidget):
     def __init__(self, win):
         super().__init__()
         self.win, self.info, self.result, self.items, self.t0 = win, None, None, {}, 0
+        self.armed, self._asked = None, None   # armed: an existing port chosen to install (install_existing's Start); _asked: the dump the existing-port question was asked for
         self.porter = Porter(self); self.porter.event.connect(self.on_event); self.porter.finished.connect(self.on_finished)
         v = QVBoxLayout(self)
 
@@ -122,13 +127,16 @@ class PortTab(QWidget):
         self.cancel_btn = QPushButton('Cancel'); self.cancel_btn.setEnabled(False); self.cancel_btn.clicked.connect(self.cancel)
         self.open_btn = QPushButton('Open output folder'); self.open_btn.setEnabled(False); self.open_btn.clicked.connect(self.open_out)
         self.inst_btn = QPushButton('Install on device'); self.inst_btn.setEnabled(False); self.inst_btn.clicked.connect(self.install_now)
+        self.inst2_btn = QPushButton('Install existing port…'); self.inst2_btn.clicked.connect(self.install_existing); self.inst2_btn.setToolTip(INST2_TIP)
         for b in (self.port_btn, self.cancel_btn): bar.addWidget(b)
         bar.addStretch(1)
-        for b in (self.open_btn, self.inst_btn): bar.addWidget(b)
+        for b in (self.open_btn, self.inst_btn, self.inst2_btn): bar.addWidget(b)
         v.addLayout(bar)
 
         self.step = QLabel(''); self.prog = QProgressBar(); self.prog.setTextVisible(True); self.prog.setRange(0, 1000); self.prog.setValue(0)
-        v.addWidget(self.step); v.addWidget(self.prog)
+        self.port_line = QLabel(''); self.port_line.setTextFormat(Qt.RichText); self.port_line.setWordWrap(True); self.port_line.setVisible(False)
+        self.port_line.linkActivated.connect(self.port_link)   # change: pick another; remove: clear the selection
+        v.addWidget(self.port_line); v.addWidget(self.step); v.addWidget(self.prog)
         split = QSplitter(Qt.Vertical)
         self.stages = QTreeWidget(); self.stages.setHeaderLabels(['', 'Stage', 'Result', 'Time']); self.stages.setRootIsDecorated(False)
         hh = self.stages.header(); hh.setSectionResizeMode(0, QHeaderView.ResizeToContents); hh.setSectionResizeMode(1, QHeaderView.ResizeToContents); hh.setSectionResizeMode(2, QHeaderView.Stretch)
@@ -189,6 +197,35 @@ class PortTab(QWidget):
         self.app_name.setPlaceholderText(info.get('name') or 'the game\'s name')
         self.package.setPlaceholderText(a.get('package') or 'the profile\'s package')
         self.update_port_button()
+        self.maybe_existing(info)
+
+    def maybe_existing(self, info):   # the dump just picked already has a port in the output folder: say so and offer the ways (asked once per dump + output folder)
+        if not info.get('supported'): return
+        found = self.existing_ports(info['title_id'])
+        if not found: return
+        key = (info['title_id'], self.out.text().strip() or config.load().get('out'))
+        if self._asked == key: return
+        self._asked = key
+        d, m = max(found, key=lambda t: t[1].get('made', ''))
+        name = info.get('name') or info['title_id']
+        box = QMessageBox(self)
+        box.setWindowTitle('A port already exists')
+        box.setText(f'A port of {name} is already in {d.parent}:\n{d.name}'
+                    + (f" — version {m['version']}, made {m['made']}" if m.get('made') else (f" — version {m['version']}" if m.get('version') else ''))
+                    + (f'\n(newest of {len(found)} here)' if len(found) > 1 else '')
+                    + '\n\nWhat would you like to do?')
+        use = box.addButton('Install the existing port', QMessageBox.ActionRole)
+        again = box.addButton('Port again (overwrites it; what it can reuse is reused)', QMessageBox.ActionRole)
+        new = box.addButton('New port beside it (.test package)', QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is use:
+            self.arm_port(d)
+        elif box.clickedButton() is new:
+            pkg = (info.get('android') or {}).get('package') or ''
+            self.app_name.setText((info.get('name') or 'Game') + ' Test')
+            if pkg: self.package.setText(pkg + ('' if pkg.endswith('.test') else '.test'))
+            self.card.setText(self.card.text() + '<br><span style="color:#1565c0">New port: the name and package are set for a test build beside the existing one — press Port to make it.</span>')
 
     def update_port_button(self):   # a supported game, or any game with Experimental ticked
         i = self.info or {}
@@ -230,14 +267,80 @@ class PortTab(QWidget):
         if self.shared_font.text().strip(): args += ['--shared-font', self.shared_font.text().strip()]
         if self.debug.isChecked(): args.append('--debug')
         if self.experimental.isChecked() and not self.info.get('supported'): args.append('--experimental')
+        self.port_line.clear(); self.port_line.setVisible(False)   # this run makes its own port: the earlier selection's line goes
         self.run(args)
 
     def install_now(self):
-        if not self.result: return
-        args = ['install', self.result['data'], '--apk', self.result['apk'], '--progress', 'json']
+        if self.armed:   # an existing port is selected: Install on device pushes it (no dump and no prod.keys needed)
+            data = self.armed['data']; apk = self.armed['apk'] or data.with_name(data.name.removesuffix('-data') + '.apk')
+        elif self.result:
+            data, apk = Path(self.result['data']), Path(self.result['apk'])
+        else: return
+        args = ['install', str(data), '--apk', str(apk), '--progress', 'json']
         if self.device.currentData(): args += ['--device', self.device.currentData()]
         if self.replace_signer.isChecked(): args.append('--replace-signer')
         self.run(args + self.romfs_args())
+
+    def port_link(self, href):   # the selected port's links: change picks another; remove clears the selection
+        if href == 'remove':
+            self.disarm_port()
+            self.update_port_button()
+        else:
+            self.install_existing()
+
+    def install_existing(self):   # an earlier port's data pack (<App>-data), no dump: pick it, then Port runs porter install (porter/cli.py cmd_install)
+        data = QFileDialog.getExistingDirectory(self, 'The port to install: its data pack folder (<App>-data)', self.folder.text() or str(Path.home()))
+        if data: self.arm_port(Path(data))
+
+    def arm_port(self, data):
+        if not (data / 'nx2a-data.json').is_file():
+            self.append("[RED] that folder is not a port's data pack (it holds no nx2a-data.json); pick the <App>-data folder beside the port's APK")
+            return
+        apk = data.with_name(data.name.removesuffix('-data') + '.apk')
+        if not apk.is_file():
+            apk = QFileDialog.getOpenFileName(self, "The port's APK (none beside the data pack)", str(data.parent), 'APK (*.apk)')[0]
+            if not apk: return
+            apk = Path(apk)
+        try: m = json.loads((data / 'nx2a-data.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError): m = {}
+        self.armed = {'data': data, 'apk': apk}
+        self.show_selected(data, m.get('name') or data.name.removesuffix('-data'),
+                           m.get('display') or m.get('version') or '', m.get('package') or '')
+        self.inst_btn.setEnabled(True)
+
+    def show_selected(self, data, name, ver, pkg):   # the line above the progress bar: what Port would install, with change / remove
+        self.port_line.setText(f'Selected: <b>{html.escape(name)}</b>'
+                               + (f' &nbsp;·&nbsp; {html.escape(ver)}' if ver else '')
+                               + (f' &nbsp;·&nbsp; {html.escape(pkg)}' if pkg else '')
+                               + ' &nbsp;·&nbsp; press <b>Install on device</b> to push to the device'
+                               + ' &nbsp;·&nbsp; <a href="change">change</a> &nbsp; <a href="remove">remove</a>')
+        self.port_line.setToolTip(html.escape(str(data))); self.port_line.setVisible(True)
+
+    def arm_result(self, data):   # a port that just finished: it fills the selected line like an existing port's (Install on device pushes it again, no dump needed)
+        self.armed = {'data': data, 'apk': None}
+        try: m = json.loads((data / 'nx2a-data.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError): m = {}
+        apk = Path(self.result['apk']) if self.result.get('apk') else data.with_name(data.name.removesuffix('-data') + '.apk')
+        if apk.is_file(): self.armed['apk'] = apk
+        self.show_selected(data, m.get('name') or self.result.get('name') or data.name.removesuffix('-data'),
+                           m.get('display') or m.get('version') or (self.result.get('display') or self.result.get('version') or ''),
+                           m.get('package') or self.result.get('package') or '')
+
+    def disarm_port(self, clear_line=True):
+        self.armed = None
+        if clear_line: self.port_line.clear(); self.port_line.setVisible(False)
+
+    def existing_ports(self, title_id):   # the ports of this game in the output folder (or the configured one): [(<App>-data, manifest)]
+        out = self.out.text().strip() or config.load().get('out')
+        if not out: return []
+        found = []
+        for d in Path(out).glob('*-data'):
+            man = d / 'nx2a-data.json'
+            if not man.is_file(): continue
+            try: m = json.loads(man.read_text(encoding='utf-8'))
+            except (OSError, ValueError): continue
+            if m.get('title_id') == title_id: found.append((d, m))
+        return found
 
     def romfs_args(self):   # porter install --romfs-at / --romfs-push (porter/install.py)
         return (['--romfs-at', self.romfs_at.text().strip()] if self.romfs_at.text().strip() else []) + (['--romfs-push'] if self.romfs_push.isChecked() else [])
@@ -245,7 +348,8 @@ class PortTab(QWidget):
     def run(self, args):
         self.stages.clear(); self.items = {}; self.log.clear(); self.prog.setValue(0); self.step.setText('starting…')
         self.result = None; self.t0 = time.time(); self.cancelled = False
-        for b in (self.port_btn, self.open_btn, self.inst_btn): b.setEnabled(False)
+        for b in (self.port_btn, self.open_btn, self.inst_btn, self.inst2_btn): b.setEnabled(False)
+        self.disarm_port(args[0] == 'install')   # an install run consumes the selection (its line goes with it); a port run's line start() already cleared
         self.cancel_btn.setEnabled(True)
         self.append('$ porter ' + ' '.join(f'"{a}"' if ' ' in a else a for a in args))
         self.porter.start(args)
@@ -286,6 +390,7 @@ class PortTab(QWidget):
             self.append(ev.get('msg', ''))
         elif e == 'result':
             self.result = ev
+            if ev.get('data'): self.arm_result(Path(ev['data']))   # the finished port fills the selected line: Port installs it again, no dump
 
     def on_tick(self):   # the running stage's elapsed time
         if not self.porter.running(): return
@@ -296,6 +401,7 @@ class PortTab(QWidget):
     def on_finished(self, code):
         self.cancel_btn.setEnabled(False)
         self.update_port_button()
+        self.inst2_btn.setEnabled(True)   # (installing an existing port needs no run first: always enabled again, success or failure)
         took = hms(time.time() - self.t0)
         if code == 0:
             self.step.setText(f'done in {took}'); self.prog.setRange(0, 1000); self.prog.setValue(1000)
