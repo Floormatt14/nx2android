@@ -153,12 +153,13 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 
 // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
 // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_AUDIO, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_MENUBTN, OVM_AUDIO, OVM_MODS, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
-            // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels)
+            // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels); OVM_MENUBTN: the on-screen menu button
+            // (front_android.c g_menu_btn: settings.txt menubtn= beats env.txt's DM_MENU_BUTTON); OVM_MODS: the mods manager (below, OVMOD_*)
 #define OVM_TABS 2
-#define OVM_PER_TAB 5
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_AUDIO}};
+#define OVM_PER_TAB 6
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD, OVM_MENUBTN}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_AUDIO, OVM_MODS}};
 static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows (as many for every tab: the panel keeps its size), Resume
 int dm_menu_audio_available(void);
@@ -172,7 +173,8 @@ static inline int ov_menu_item(int tab, int row) {
 #define OV_OPACITY_MIN 20    // the gamepad's opacity, percent (the Opacity slider, settings.txt opacity=)
 #define OV_OPACITY_MAX 80
 // what the menu shows (-1 = closed): bit 0 the gamepad is on, bit 1 rumble is on, bit 2 docked, bit 3 the frame rate shown, bits 4..7 the highlighted row + 1
-// (0 = none), bit 8 the open tab, bits 9..15 the opacity in percent, bits 20..23 the last export's outcome (OVX_*), bits 24..27 a count of exports (its name
+// (0 = none), bit 8 the open tab, bits 9..15 the opacity in percent, bit 29 the menu button is on (front_android.c g_menu_btn), bits 20..23 the last export's
+// outcome (OVX_*), bits 24..27 a count of exports (its name
 // changes with each). Bit 16: the text entry's panel instead (its edit count below); bit 17: the layout editor (OVE_ST_* below); bit 18: the save picker (OVS_ST)
 int dm_menu_state(void);
 enum { OVX_IDLE, OVX_BUSY, OVX_DONE, OVX_NOSAVE, OVX_FAILED };   // Export save: the button; copying; the export's name; the game has not saved yet; failed
@@ -236,6 +238,25 @@ static inline int ov_ed_button_at(float x, float y, const float p[4], int first,
 enum { OVS_EMPTY, OVS_TITLE, OVS_ITEM, OVS_NOTE, OVS_BUTTON, OVS_BACK };   // a row: nothing; the title (left) and the page (right); a save (its name, its size);
 typedef struct { int style; char left[80], right[40]; } ov_srow;            // a line of text; a button (the import); Back or Cancel, centred as Resume is
 int dm_save_rows(ov_srow rows[OVM_ROWS]);   // front_android.c: the picker's rows, 0 when it is not open
+
+// ---- the mods manager (front_android.c, from the menu's Mods): the pause menu's panel again, one view: the game's RomFS mods, the folders of the files
+// folder's romfs_mods/ (found the way the imported saves are), OVM_ROWS - 3 to a page (left and right page), Restart now (the app ends and relaunches
+// itself: the title says a change applies on a restart), Back; a tap turns a mod on or off. dm_menu_state: bit 19, bits 4..7 the highlighted row + 1,
+// bits 20..27 the manager's edit count (a page, a toggle) ----
+#define OVMOD_ST 0x80000
+int dm_mods_rows(ov_srow rows[OVM_ROWS]);   // front_android.c: the list's rows, 0 when it is not open
+
+// the paged title's right-aligned pager, drawn and hit-tested as < page x of y > (gfx_vk_present.c ov_mods_panel draws it; front_android.c md_pager_hit
+// hit-tests it): r is the title row's rect in the caller's pixels (the front end's window pixels, the raster's half-scale ones — every measure scales
+// with the row height, so both agree), is the text size in those pixels, pw and cw the page text's and a chevron's width in them. Writes the "<" chevron's
+// rect to lt, the page text's to pt, the ">"'s to gt (x, y, width, height; the page text sits between the chevrons, the whole group right-aligned)
+static inline void ov_menu_pager(const float r[4], int is, float pw, float cw, float lt[4], float pt[4], float gt[4]) {
+    float rh = r[3], gap = rh * 0.35f, pad = rh * 0.06f, x1 = r[0] + r[2] - rh * 0.15f, gx = x1 - (cw + gap + pw + gap + cw);
+    lt[0] = fmaxf(r[0], gx - pad);              lt[1] = r[1]; lt[2] = cw + gap / 2 + 2 * pad; lt[3] = rh;   // the chevrons' tappable rects run a little wider than the glyphs, so a near miss still taps
+    pt[0] = gx + cw + gap; pt[1] = r[1]; pt[2] = pw;      pt[3] = rh;
+    gt[0] = gx + cw + gap + pw + gap / 2 - pad; gt[1] = r[1]; gt[2] = cw + gap / 2 + 2 * pad; gt[3] = rh;
+}
+int dm_pager_rects(float lt[4], float gt[4]);   // gfx_vk_present.c: the drawn pager chevrons' rects in raster pixels (the panel at half the window's scale), 0 when no pager is drawn
 
 // ---- the text entry's keyboard (front_android.c front_text_input, drawn by gfx_vk_present.c ov_text_panel), in the pause menu's panel rectangle ----
 // Four rows of ten character keys and a row of four wide ones; p is the panel's rectangle (x, y, width, height: the window's for touches, the raster's for drawing).

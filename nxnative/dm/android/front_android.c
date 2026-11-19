@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <unistd.h>
 
 void front_run(void (*guest)(void)) { guest(); }
@@ -50,6 +51,7 @@ void front_screen_match(int fps) { (void)fps; }
 static ANativeActivity *g_act;
 static jmethodID g_audio_menu_method;
 int dm_menu_audio_available(void) { return g_audio_menu_method != NULL; }
+const uint8_t *dm_overlay_font(void);   // overlay_theme.c: the gamepad's text font, shared with the mods pager's hit test (pf_width)
 AAssetManager *dm_front_assets(void) { return g_act ? g_act->assetManager : NULL; }   // the APK's assets (overlay_theme.c: the gamepad's theme)
 static pthread_mutex_t g_win_mu = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *g_win, *g_external_win;
@@ -82,6 +84,11 @@ static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 // not drawn and not touchable, on the gamepad and over the pause menu, so its corner of the screen is the game's. Back (the system's back gesture or key) and a
 // controller's Home/Menu key open the menu (handle_event); the layout editor shows it darkened. The external screen's gamepad keeps it (externalOverlay)
 static _Atomic int g_menu_btn = 1;
+static int g_menu_btn_env = 1;   // env.txt's DM_MENU_BUTTON at boot: settings.txt's menubtn= row is written only when the player chose differently (settings_save)
+// the mods manager's table (the pause menu's Mods panel, below): the game's RomFS mod folders, settings.txt's mod= rows, in load order (first root wins)
+#define MD_MAX 16
+static pthread_mutex_t g_md_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { int n; struct { char path[320]; int on; } e[MD_MAX]; } g_md;
 static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1), 1 when hidden
@@ -91,7 +98,7 @@ static const char *const LAYOUT_NAMES[2] = {"tablet", "phone"};
 static int ctl_named(const char *n) { for (int i = 0; i < OV_N; i++) if (!strcmp(OV_LAYOUTS[0][i].name, n)) return i; return -1; }
 int dm_opmode(void); void dm_set_opmode(int m);   // hle_oe.c: 0 handheld, 1 docked; a change reaches the game as the Switch's operation mode notification
 static void settings_load(void) {
-    char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[128];
+    char p[600]; snprintf(p, sizeof p, "%s/settings.txt", g_root); FILE *f = fopen(p, "r"); char line[600];   // (mod= rows carry long paths: 128 would cut them)
     if (!f) return;
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
@@ -109,6 +116,14 @@ static void settings_load(void) {
             if (hid == 1 && OV_LAYOUTS[l][i].kind != OV_MENU) atomic_store(&g_cust[0][l][i][3], 1);
         } else if (sscanf(line, "menu_x=%d", &v) == 1 && v >= 0 && v <= 10000) { int m = ctl_named("menu"); for (int l = 0; l < 2 && m >= 0; l++) atomic_store(&g_cust[0][l][m][0], v + 1); }   // before
         else if (sscanf(line, "menu_y=%d", &v) == 1 && v >= 0 && v <= 10000) { int m = ctl_named("menu"); for (int l = 0; l < 2 && m >= 0; l++) atomic_store(&g_cust[0][l][m][1], v + 1); }   // the editor
+        else if (sscanf(line, "menubtn=%d", &v) == 1) atomic_store(&g_menu_btn, v != 0);   // the player's choice beats env.txt's DM_MENU_BUTTON
+        else if (!strncmp(line, "mod=", 4)) {   // mod=<on> <path>, one RomFS mod folder per row, in load order (first root wins, mods_apply)
+            int on, l; if (sscanf(line + 4, "%d %n", &on, &l) != 1 || g_md.n >= MD_MAX) continue;
+            char *e = line + strlen(line); while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+            if (!line[4 + l]) continue;
+            g_md.e[g_md.n].on = on != 0;
+            snprintf(g_md.e[g_md.n].path, sizeof g_md.e[0].path, "%s", line + 4 + l); g_md.n++;
+        }
     }
     fclose(f);
 }
@@ -118,6 +133,10 @@ static void settings_save(void) {
     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
+    if (atomic_load(&g_menu_btn) != g_menu_btn_env) fprintf(f, "menubtn=%d\n", atomic_load(&g_menu_btn));   // (only once the player chose: until then env.txt decides)
+    pthread_mutex_lock(&g_md_mu);   // the mods manager's rows, in load order (mods_apply composes the overlay from them at boot)
+    for (int k = 0; k < g_md.n; k++) fprintf(f, "mod=%d %s\n", g_md.e[k].on, g_md.e[k].path);
+    pthread_mutex_unlock(&g_md_mu);
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]), hid = atomic_load(&c[3]);
         if ((x && y) || z || hid) fprintf(f, "ui=%s,%s,%d,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000, hid);
@@ -584,13 +603,17 @@ static _Atomic int g_tx_ver;   // the text entry's edit count: the panel is draw
 static _Atomic int g_ed_st;    // the layout editor's state for dm_menu_state (overlay_layout.h OVE_ST)
 static _Atomic int g_sp_on, g_sp_hi = -1, g_sp_ver;   // the save picker (below): open, its highlighted row, its edit count
 static _Atomic int g_sv_st, g_sv_n;                   // Export save: its outcome (overlay_layout.h OVX_*), the exports made
+static _Atomic int g_md_on, g_md_br, g_md_hi = -1, g_md_ver;   // the mods manager (below): open, its browser view, the highlighted row, its edit count
+static void md_key(uint64_t bit); static void md_touch(AInputEvent *e, float W, float H); static void md_back(void); static void md_open(void);
 int dm_menu_state(void) {
     if (atomic_load(&g_tx_on)) return 1 << 16 | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
     if (!atomic_load(&g_menu)) return -1;
     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
+    if (atomic_load(&g_md_on)) return OVMOD_ST | (atomic_load(&g_md_hi) + 1) << 4 | (atomic_load(&g_md_ver) & 255) << 20;
     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
-           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28;
+           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28 |
+           atomic_load(&g_menu_btn) << 29;
 }
 int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
 static void menu_open(int hi) {
@@ -609,6 +632,7 @@ static void menu_open(int hi) {
 static void ed_cancel(void); static void sp_back(void);
 static void menu_close(void) {
     if (atomic_load(&g_edit)) { ed_cancel(); return; }   // the editor first: its changes are kept or thrown away before the game goes on
+    if (atomic_load(&g_md_on)) { md_back(); return; }    // the mods manager: the browser goes up a folder (or to the list), the list closes
     if (atomic_load(&g_sp_on)) { sp_back(); return; }    // the save picker: back a step
     if (!atomic_exchange(&g_menu, 0)) return;
     g_menu_ptr = -1; atomic_store(&g_menu_t, 0);
@@ -639,6 +663,8 @@ static void menu_do(int item) {
     else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
     else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
     else if (item == OVM_PAD) { atomic_store(&g_set_labels, !pad_labels()); settings_save(); }   // at once (pad_labels)
+    else if (item == OVM_MENUBTN) { atomic_store(&g_menu_btn, !atomic_load(&g_menu_btn)); settings_save(); LOG("[overlay] the menu button %s", atomic_load(&g_menu_btn) ? "shown (Back also opens the menu)" : "hidden (Back and Home open the menu)"); }
+    else if (item == OVM_MODS) { md_open(); return; }
     else if (item == OVM_TAB) { menu_tab(atomic_load(&g_menu_tab) + 1); return; }
     else if (item == OVM_EDIT) { dm_haptics_android_tap(); ed_open(); return; }
     else if (item == OVM_OPACITY) return;   // (the slider is dragged, or stepped with left and right)
@@ -678,6 +704,7 @@ static void menu_touch(AInputEvent *e, float W, float H) {   // a press on a row
 static void ed_key(uint64_t bit); static void sp_key(uint64_t bit);
 static void menu_key(uint64_t bit) {   // a controller key pressed while the menu is open: up and down go through the rows, left and right change the tab or the
     if (atomic_load(&g_edit)) { ed_key(bit); return; }   // opacity on their rows, L and R change the tab anywhere, A does the row, B and + close
+    if (atomic_load(&g_md_on)) { md_key(bit); return; }
     if (atomic_load(&g_sp_on)) { sp_key(bit); return; }
     int hi = atomic_load(&g_menu_hi), tab = atomic_load(&g_menu_tab), item = hi >= 0 ? ov_menu_item(tab, hi) : -1;
     if (bit == DM_BTN_UP || bit == DM_BTN_DOWN) {
@@ -809,6 +836,273 @@ int dm_save_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_save_panel)
         SP_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
     }
     pthread_mutex_unlock(&g_sp_mu);
+    return 1;
+}
+
+// ---- the mods manager (overlay_layout.h OVMOD_*), from the menu's Mods: the game's RomFS mods, found the way the imported saves are. A mod is a folder
+// in the files folder's romfs_mods/ (with the mod's romfs/ layer inside): copied or moved there by a file manager (or pushed by porter over adb), it is
+// listed the next time the panel opens, on unless settings.txt's mod= row says off (mod=<0/1> <name>, or an absolute path from a hand edit: a mod kept
+// somewhere else on the device). A tap turns a mod on or off — the overlay mounts at boot, which the panel's title says — and Restart now ends the app and
+// relaunches it (it schedules its own launch first), so the change applies at once. When two mods replace the same file, the higher one in the list serves
+// it (the list's order is each mod's priority; a mod always beats the base RomFS). A controller: up and down choose, A does, B goes back, left and right
+// page; a finger taps a row, the paged title's chevrons to page, outside the panel to go back. Add folder… opens the browser: a first view of
+// bookmarks (where mods usually are: Download, Documents, the app's files folder), then the folders of one directory; a folder with a romfs/ layer is
+// marked, since that layer is what the game reads, and choosing one links it where it is (an absolute mod= row) ----
+#define MD_START "/storage/emulated/0"
+#define MD_PER (OVM_ROWS - 4)   // a page's mods; Add folder…, Restart now and Back the last three rows
+static const char *const MD_BOOKMARKS[][2] = {   // name, where (NULL: the app's files folder); the browser opens here
+    {"Download", "/storage/emulated/0/Download"}, {"Documents", "/storage/emulated/0/Documents"}, {"App data", NULL},
+};
+static void md_changed(void) { atomic_fetch_add(&g_md_ver, 1); dm_overlay_redraw(); }
+static const char *md_base(const char *p) { const char *b = strrchr(p, '/'); return b && b[1] ? b + 1 : p; }
+static void md_dir(char *out, size_t cap) { snprintf(out, cap, "%s/romfs_mods", g_root); }
+static struct { int n, page, ptr, row; char dir[1024]; struct { char name[96]; char to[128]; int romfs; } ls[64]; } g_md_v = {.ptr = -1};   // the list's or the browser's page; the browser's directory ("" the bookmarks), its folders and their count
+static void md_scan(void) {   // the bookmarks, or the current directory's folders, in name order; a folder with a romfs/ layer is marked (the caller holds g_md_mu)
+    g_md_v.n = 0;
+    if (!g_md_v.dir[0]) {   // the bookmarks
+        for (size_t k = 0; k < sizeof MD_BOOKMARKS / sizeof MD_BOOKMARKS[0] && g_md_v.n < (int)(sizeof g_md_v.ls / sizeof g_md_v.ls[0]); k++) {
+            char to[128], sub[1200]; struct stat st;
+            snprintf(to, sizeof to, "%s", MD_BOOKMARKS[k][1] ? MD_BOOKMARKS[k][1] : g_root);
+            if (MD_BOOKMARKS[k][1] && (stat(to, &st) || !S_ISDIR(st.st_mode))) continue;   // (the app's files folder always is)
+            snprintf(g_md_v.ls[g_md_v.n].name, sizeof g_md_v.ls[0].name, "%s", MD_BOOKMARKS[k][0]);
+            snprintf(g_md_v.ls[g_md_v.n].to, sizeof g_md_v.ls[0].to, "%s", to);
+            snprintf(sub, sizeof sub, "%s/romfs", to); g_md_v.ls[g_md_v.n].romfs = !stat(sub, &st) && S_ISDIR(st.st_mode);
+            g_md_v.n++;
+        }
+        return;
+    }
+    struct dirent **ents = NULL; int k = scandir(g_md_v.dir, &ents, NULL, alphasort);
+    for (int i = 0; i < k; i++) {
+        char sub[1100]; struct stat st;
+        snprintf(sub, sizeof sub, "%s/%s", g_md_v.dir, ents[i]->d_name);
+        if (!stat(sub, &st) && S_ISDIR(st.st_mode) && g_md_v.n < (int)(sizeof g_md_v.ls / sizeof g_md_v.ls[0])) {
+            snprintf(g_md_v.ls[g_md_v.n].name, sizeof g_md_v.ls[0].name, "%s", ents[i]->d_name);
+            g_md_v.ls[g_md_v.n].to[0] = 0;
+            snprintf(sub, sizeof sub, "%s/romfs", sub); g_md_v.ls[g_md_v.n].romfs = !stat(sub, &st) && S_ISDIR(st.st_mode);
+            g_md_v.n++;
+        }
+        free(ents[i]);
+    }
+    free(ents);
+}
+static void md_dir_set(const char *d) {
+    pthread_mutex_lock(&g_md_mu); snprintf(g_md_v.dir, sizeof g_md_v.dir, "%s", d); md_scan(); g_md_v.page = 0; pthread_mutex_unlock(&g_md_mu);
+}
+static void md_add(const char *p) {   // a folder chosen in the browser: linked where it is (an absolute mod= row); listed already → turned on
+    int idx = -1;
+    pthread_mutex_lock(&g_md_mu);
+    for (int k = 0; k < g_md.n; k++) if (!strcmp(g_md.e[k].path, p)) { idx = k; g_md.e[k].on = 1; break; }
+    if (idx < 0 && g_md.n < MD_MAX) { idx = g_md.n; g_md.e[g_md.n].on = 1; snprintf(g_md.e[g_md.n].path, sizeof g_md.e[0].path, "%s", p); g_md.n++; }
+    pthread_mutex_unlock(&g_md_mu);
+    if (idx < 0) { LOG("[RED] [mods] %d mod folders is the most settings.txt holds: take one out by hand (a mod= row in settings.txt)", MD_MAX); return; }
+    settings_save();
+    LOG("[mods] %s: linked where it is (the overlay mounts at the next start)", p);
+    atomic_store(&g_md_br, 0); atomic_store(&g_md_hi, idx % MD_PER + 1);
+    pthread_mutex_lock(&g_md_mu); g_md_v.page = idx / MD_PER; pthread_mutex_unlock(&g_md_mu);
+    md_changed();
+}
+static void md_refresh(int save) {   // the table = settings.txt's rows (their order) + romfs_mods/'s folders not in it (on, alphabetical). A folder row whose folder is gone goes; an absolute row always stays — it is deliberate configuration, and its drive may just be out (an SD card, a USB drive)
+    pthread_mutex_lock(&g_md_mu);
+    int keep = 0;
+    for (int k = 0; k < g_md.n; k++) {
+        char d[600]; struct stat st; int abs_ = strchr(g_md.e[k].path, '/') != NULL;
+        if (abs_) snprintf(d, sizeof d, "%s", g_md.e[k].path);
+        else { char dir[512]; md_dir(dir, sizeof dir); snprintf(d, sizeof d, "%s/%s", dir, g_md.e[k].path); }
+        if (!stat(d, &st) && S_ISDIR(st.st_mode)) g_md.e[keep++] = g_md.e[k];
+        else if (abs_) { LOG("[mods] %s: not there or not readable now; the row stays (mods_apply leaves it out)", g_md.e[k].path); g_md.e[keep++] = g_md.e[k]; }
+        else LOG("[mods] %s: the folder is gone; dropped", g_md.e[k].path);
+    }
+    g_md.n = keep;
+    char dir[512]; md_dir(dir, sizeof dir);
+    struct dirent **ents = NULL; int k = scandir(dir, &ents, NULL, alphasort);
+    for (int i = 0; i < k && g_md.n < MD_MAX; i++) {
+        char d[600]; struct stat st; snprintf(d, sizeof d, "%s/%s", dir, ents[i]->d_name);
+        if (ents[i]->d_name[0] != '.' && !stat(d, &st) && S_ISDIR(st.st_mode)) {
+            int j; for (j = 0; j < g_md.n && strcmp(g_md.e[j].path, ents[i]->d_name); j++) {}
+            if (j == g_md.n) { g_md.e[g_md.n].on = 1; snprintf(g_md.e[g_md.n].path, sizeof g_md.e[0].path, "%s", ents[i]->d_name); g_md.n++; }
+        }
+        free(ents[i]);
+    }
+    free(ents);
+    pthread_mutex_unlock(&g_md_mu);
+    if (save) settings_save();
+}
+static void md_open(void) {
+    md_refresh(0);   // romfs_mods/'s folders come as they are copied there; only the player's toggles write mod= rows
+    atomic_store(&g_md_br, 0); atomic_store(&g_md_hi, g_md.n ? 1 : OVM_ROWS - 3); atomic_store(&g_md_on, 1); md_changed();
+    LOG("[mods] manager opened: %d mod folder(s)", g_md.n);
+}
+static void *md_restart_run(void *a) {   // (Restart now) the app schedules its own relaunch about a second out and ends: the next start mounts the overlay
+    (void)a;
+    JNIEnv *E = g_act->env; jobject act = g_act->clazz;
+    do {
+        jclass cC = (*E)->GetObjectClass(E, act);
+        jmethodID mPkg = (*E)->GetMethodID(E, cC, "getPackageName", "()Ljava/lang/String;");
+        jstring pkg = mPkg ? (*E)->CallObjectMethod(E, act, mPkg) : NULL; if (jx(E) || !pkg) break;
+        const char *pc = (*E)->GetStringUTFChars(E, pkg, NULL); char pkgc[128]; snprintf(pkgc, sizeof pkgc, "%s", pc ? pc : ""); if (pc) (*E)->ReleaseStringUTFChars(E, pkg, pc);
+        jmethodID mPM = (*E)->GetMethodID(E, cC, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        jobject pm = mPM ? (*E)->CallObjectMethod(E, act, mPM) : NULL; if (jx(E) || !pm) break;
+        jmethodID mLI = (*E)->GetMethodID(E, (*E)->GetObjectClass(E, pm), "getLaunchIntentForPackage", "(Ljava/lang/String;)Landroid/content/Intent;");
+        jstring p2 = (*E)->NewStringUTF(E, pkgc); jobject it = mLI && p2 ? (*E)->CallObjectMethod(E, pm, mLI, p2) : NULL; if (jx(E) || !it) break;
+        jclass cPI = (*E)->FindClass(E, "android/app/PendingIntent");
+        jmethodID mGA = cPI ? (*E)->GetStaticMethodID(E, cPI, "getActivity", "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;") : NULL; if (jx(E) || !mGA) break;
+        jobject pi = (*E)->CallStaticObjectMethod(E, cPI, mGA, act, 0, it, 0x02000000); if (jx(E) || !pi) break;   // 0x02000000 FLAG_IMMUTABLE
+        jstring al = (*E)->NewStringUTF(E, "alarm");
+        jmethodID mAS = (*E)->GetMethodID(E, cC, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        jobject am = al && mAS ? (*E)->CallObjectMethod(E, act, mAS, al) : NULL; jclass cAM = (*E)->FindClass(E, "android/app/AlarmManager");
+        if (jx(E) || !am || !cAM) break;
+        jmethodID mSet = (*E)->GetMethodID(E, cAM, "setExactAndAllowWhileIdle", "(IJLandroid/app/PendingIntent;)V");
+        if (!mSet || jx(E)) mSet = (*E)->GetMethodID(E, cAM, "set", "(IJLandroid/app/PendingIntent;)V");   // without the exact-alarm permission
+        jmethodID mNow = (*E)->GetStaticMethodID(E, (*E)->FindClass(E, "java/lang/System"), "currentTimeMillis", "()J");
+        jlong now = mNow ? (*E)->CallStaticLongMethod(E, (*E)->FindClass(E, "java/lang/System"), mNow) : 0;
+        if (mSet) (*E)->CallVoidMethod(E, am, mSet, (jint)1, now + 1200, pi);   // 1 RTC_WAKEUP
+        if (!jx(E)) LOG("[mods] the app restarts itself to mount the overlay");
+        else { (*E)->ExceptionClear(E); LOG("[mods] the app could not schedule its own restart: open it again from the launcher"); }
+    } while (0);
+    sleep(2);   // the log flushes, the panel's note stays up for a moment
+    LOG("[mods] the app ends; it comes back on its own (or from the launcher)");
+    _exit(0);
+}
+static void md_restart(void) {
+    pthread_t t; if (pthread_create(&t, NULL, md_restart_run, NULL)) md_restart_run(NULL); else pthread_detach(t);
+}
+static void md_back(void) {   // B, the Back row, or a tap outside the panel: the browser goes up one folder (at the bookmarks or the storage root: to the list), the list closes
+    dm_haptics_android_tap();
+    if (!atomic_load(&g_md_br)) { atomic_store(&g_md_on, 0); atomic_store(&g_md_hi, -1); md_changed(); return; }
+    pthread_mutex_lock(&g_md_mu); int up_ok = g_md_v.dir[0] && strcmp(g_md_v.dir, MD_START); pthread_mutex_unlock(&g_md_mu);
+    if (up_ok) {
+        char up[1024]; pthread_mutex_lock(&g_md_mu); snprintf(up, sizeof up, "%s", g_md_v.dir); pthread_mutex_unlock(&g_md_mu);
+        char *s = strrchr(up, '/');
+        if (s && s > up && (size_t)(s - up) >= strlen(MD_START)) { *s = 0; md_dir_set(up); atomic_store(&g_md_hi, 1); md_changed(); return; }
+    }
+    atomic_store(&g_md_br, 0); atomic_store(&g_md_hi, g_md.n ? 1 : OVM_ROWS - 3); md_changed();   // the storage root or the bookmarks: back to the list
+}
+static void md_page(int d) {
+    pthread_mutex_lock(&g_md_mu);
+    int n = atomic_load(&g_md_br) ? g_md_v.n : g_md.n, pages = (n + MD_PER - 1) / MD_PER, p = g_md_v.page + d, ok = pages > 1 && p >= 0 && p < pages;
+    if (ok) g_md_v.page = p;
+    pthread_mutex_unlock(&g_md_mu);
+    if (!ok) return;
+    dm_haptics_android_tap(); atomic_store(&g_md_hi, 1); md_changed();
+}
+static int md_selectable(int row) {
+    pthread_mutex_lock(&g_md_mu);
+    int br = atomic_load(&g_md_br), k = (br ? g_md_v.n : g_md.n) - g_md_v.page * MD_PER; if (k < 0) k = 0; if (k > MD_PER) k = MD_PER;
+    int dir = br && g_md_v.dir[0]; pthread_mutex_unlock(&g_md_mu);
+    if (row == OVM_ROWS - 3 || row == OVM_ROWS - 1) return 1;   // Add folder… / Choose this folder / Browse all folders; Back
+    if (br && row == OVM_ROWS - 2) return dir;   // Up one folder (a directory view only)
+    return row >= 1 && row <= k;
+}
+static void md_do(int row) {
+    if (!md_selectable(row)) return;
+    dm_haptics_android_tap();
+    if (row == OVM_ROWS - 1) { md_back(); return; }
+    int br = atomic_load(&g_md_br);
+    if (br && row == OVM_ROWS - 2) { md_back(); return; }   // Up one folder
+    if (row == OVM_ROWS - 3) {
+        if (!br) { atomic_store(&g_md_br, 1); atomic_store(&g_md_hi, 1); md_dir_set(""); md_changed(); return; }   // Add folder…: the bookmarks
+        int dir; pthread_mutex_lock(&g_md_mu); dir = g_md_v.dir[0] != 0; pthread_mutex_unlock(&g_md_mu);
+        if (dir) { char d[1024]; pthread_mutex_lock(&g_md_mu); snprintf(d, sizeof d, "%s", g_md_v.dir); pthread_mutex_unlock(&g_md_mu); md_add(d); return; }   // Choose this folder
+        md_dir_set(MD_START); atomic_store(&g_md_hi, 1); md_changed();   // Browse all folders
+        return;
+    }
+    if (br) {   // into a folder, or to a bookmark
+        char d[1024]; int pick;
+        pthread_mutex_lock(&g_md_mu); pick = g_md_v.page * MD_PER + row - 1;
+        if (pick >= 0 && pick < g_md_v.n) { if (g_md_v.dir[0]) snprintf(d, sizeof d, "%s/%s", g_md_v.dir, g_md_v.ls[pick].name); else snprintf(d, sizeof d, "%s", g_md_v.ls[pick].to); }
+        else d[0] = 0;
+        pthread_mutex_unlock(&g_md_mu);
+        if (d[0]) { md_dir_set(d); atomic_store(&g_md_hi, 1); md_changed(); }
+        return;
+    }
+    pthread_mutex_lock(&g_md_mu);
+    int k = g_md_v.page * MD_PER + row - 1;
+    if (k >= 0 && k < g_md.n) { g_md.e[k].on = !g_md.e[k].on; LOG("[mods] %s: %s (the overlay mounts at the next start)", g_md.e[k].path, g_md.e[k].on ? "on" : "off"); }
+    pthread_mutex_unlock(&g_md_mu);
+    settings_save(); md_changed();
+}
+static void md_key(uint64_t bit) {
+    int hi = atomic_load(&g_md_hi);
+    if (bit == DM_BTN_UP || bit == DM_BTN_DOWN) {
+        for (int k = 0; k < OVM_ROWS; k++) { hi = hi < 0 ? (bit == DM_BTN_UP ? OVM_ROWS - 1 : 0) : (hi + (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1)) % OVM_ROWS; if (md_selectable(hi)) break; }
+        if (md_selectable(hi)) { atomic_store(&g_md_hi, hi); md_changed(); }
+    } else if (bit == DM_BTN_LEFT || bit == DM_BTN_L || bit == DM_BTN_ZL) md_page(-1);
+    else if (bit == DM_BTN_RIGHT || bit == DM_BTN_R || bit == DM_BTN_ZR) md_page(1);
+    else if (bit == DM_BTN_A) md_do(hi);
+    else if (bit == DM_BTN_B) md_back();
+}
+static int md_pager_hit(float x, float W, float H) {   // the paged title's chevrons: -1 the "<", 1 the ">", 0 elsewhere (md_touch). The rects are the renderer's own
+    pthread_mutex_lock(&g_md_mu);   // (published by ov_mods_panel after it draws, dm_pager_rects), so the touched pixels are the drawn ones; the touch is in window pixels,
+    int n = atomic_load(&g_md_br) ? g_md_v.n : g_md.n;   // the raster is the panel at half scale
+    pthread_mutex_unlock(&g_md_mu);
+    if ((n + MD_PER - 1) / MD_PER <= 1) return 0;
+    float p[4], lt[4], gt[4]; ov_menu_rect(W, H, p);
+    if (!dm_pager_rects(lt, gt)) return 0;
+    float xr = (x - p[0]) / 2;
+    if (xr >= lt[0] && xr < lt[0] + lt[2]) return -1;
+    if (xr >= gt[0] && xr < gt[0] + gt[2]) return 1;
+    return 0;
+}
+static void md_touch(AInputEvent *e, float W, float H) {   // a row is done when the finger that went down on it lifts there; outside the panel goes back; the paged
+    int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;   // title's chevrons page
+    int i = act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_UP ? 0 : ai, id = AMotionEvent_getPointerId(e, (size_t)i) & 31;
+    float x = AMotionEvent_getX(e, (size_t)i);
+    int row = ov_menu_row_at(AMotionEvent_getX(e, (size_t)i), AMotionEvent_getY(e, (size_t)i), W, H);
+    if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+        if (g_md_v.ptr >= 0) return;
+        g_md_v.ptr = id; g_md_v.row = row;
+        if (row == 0) { int hit = md_pager_hit(x, W, H); if (hit) md_page(hit); }
+        else if (md_selectable(row)) { atomic_store(&g_md_hi, row); md_changed(); }
+    } else if ((act == AMOTION_EVENT_ACTION_UP || act == AMOTION_EVENT_ACTION_POINTER_UP) && id == g_md_v.ptr) {
+        int down = g_md_v.row; g_md_v.ptr = -1;
+        if (row == down && row == -2) md_back(); else if (row == down && row > 0) md_do(row);
+    } else if (act == AMOTION_EVENT_ACTION_CANCEL) g_md_v.ptr = -1;
+}
+#define MD_ROW(i, st, ...) do { rows[i].style = st; snprintf(rows[i].left, sizeof rows[i].left, __VA_ARGS__); } while (0)
+int dm_mods_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_mods_panel)
+    if (!atomic_load(&g_md_on)) return 0;
+    memset(rows, 0, sizeof(ov_srow) * OVM_ROWS);
+    pthread_mutex_lock(&g_md_mu);
+    int br = atomic_load(&g_md_br), n = br ? g_md_v.n : g_md.n, pages = (n + MD_PER - 1) / MD_PER, k = n - g_md_v.page * MD_PER; if (k < 0) k = 0; if (k > MD_PER) k = MD_PER;
+    if (!br) {
+        MD_ROW(0, OVS_TITLE, "Mods (restart to apply)");
+        if (pages > 1) snprintf(rows[0].right, sizeof rows[0].right, "page %d of %d", g_md_v.page + 1, pages);
+        else snprintf(rows[0].right, sizeof rows[0].right, "only the top mod in the list runs");
+        if (!g_md.n) {
+            char dir[512]; md_dir(dir, sizeof dir); const char *d = strstr(dir, "Android/data/");
+            MD_ROW(1, OVS_NOTE, "No mods yet. Copy a mod's folder (it holds");
+            MD_ROW(2, OVS_NOTE, "the mod's romfs/ layer) into");
+            MD_ROW(3, OVS_NOTE, "%s", d ? d : dir);
+            MD_ROW(4, OVS_NOTE, "or link one where it is below.");
+        }
+        for (int j = 0; j < k; j++) {
+            int m = g_md_v.page * MD_PER + j;
+            MD_ROW(1 + j, OVS_ITEM, "%s", md_base(g_md.e[m].path));
+            if (g_md.e[m].on && strchr(g_md.e[m].path, '/')) {   // an absolute row says when its folder is not readable now (an SD card out, a drive unplugged)
+                char d[600]; struct stat st; snprintf(d, sizeof d, "%s", g_md.e[m].path);
+                if (stat(d, &st) || !S_ISDIR(st.st_mode)) { LOG("[RED] [mods] row %d: %s: not there or not readable (errno %d)", m, g_md.e[m].path, errno); snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "On, missing"); }
+                else snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "On");
+            } else snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "%s", g_md.e[m].on ? "On" : "Off");
+        }
+        MD_ROW(OVM_ROWS - 3, OVS_BUTTON, "Add folder..."); MD_ROW(OVM_ROWS - 2, OVS_BUTTON, "Restart now"); MD_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
+    } else if (!g_md_v.dir[0]) {   // the bookmarks
+        MD_ROW(0, OVS_TITLE, "Where is the mod?");
+        for (int j = 0; j < k; j++) {
+            MD_ROW(1 + j, OVS_ITEM, "%s", g_md_v.ls[g_md_v.page * MD_PER + j].name);
+            if (g_md_v.ls[g_md_v.page * MD_PER + j].romfs) snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "romfs");
+        }
+        MD_ROW(OVM_ROWS - 3, OVS_BUTTON, "Browse all folders"); MD_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
+    } else {
+        MD_ROW(0, OVS_TITLE, "%s", md_base(g_md_v.dir));
+        if (pages > 1) snprintf(rows[0].right, sizeof rows[0].right, "page %d of %d", g_md_v.page + 1, pages);
+        if (!g_md_v.n) MD_ROW(1, OVS_NOTE, "No folders here.");
+        for (int j = 0; j < k; j++) {
+            MD_ROW(1 + j, OVS_ITEM, "%s", g_md_v.ls[g_md_v.page * MD_PER + j].name);
+            if (g_md_v.ls[g_md_v.page * MD_PER + j].romfs) snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "romfs");
+        }
+        MD_ROW(OVM_ROWS - 3, OVS_BUTTON, "Choose this folder"); MD_ROW(OVM_ROWS - 2, OVS_BUTTON, "Up one folder"); MD_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
+    }
+    pthread_mutex_unlock(&g_md_mu);
     return 1;
 }
 
@@ -1029,7 +1323,7 @@ __attribute__((weak)) void dm_picture_rect(float r[4]);   // gfx_vk_present.c
 static void touch_event(AInputEvent *e) {
     ANativeWindow *w = phone_window(); float W = w ? (float)ANativeWindow_getWidth(w) : 1, H = w ? (float)ANativeWindow_getHeight(w) : 1;
     if (atomic_load(&g_tx_on)) { tx_touch(e, W, H); return; }   // the text entry's keys
-    if (atomic_load(&g_menu)) { if (atomic_load(&g_edit)) ed_touch(e, W, H); else if (atomic_load(&g_sp_on)) sp_touch(e, W, H); else menu_touch(e, W, H); return; }
+    if (atomic_load(&g_menu)) { if (atomic_load(&g_edit)) ed_touch(e, W, H); else if (atomic_load(&g_sp_on)) sp_touch(e, W, H); else if (atomic_load(&g_md_on)) md_touch(e, W, H); else menu_touch(e, W, H); return; }
     int act = AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK, ai = AMotionEvent_getAction(e) >> AMOTION_EVENT_ACTION_POINTER_INDEX_SHIFT;
     size_t pc = AMotionEvent_getPointerCount(e);
     if (act == AMOTION_EVENT_ACTION_DOWN || act == AMOTION_EVENT_ACTION_POINTER_DOWN) {
@@ -1379,6 +1673,33 @@ static int romfs_readable(ANativeActivity *act, int sdk) {   // 0: the game cann
     LOG("RomFS: %s, outside the app's files folder (%s granted)", r, what);
     return 1;
 }
+// ---- the mods' overlay, composed at boot (the pause menu's Mods panel manages the list): the enabled mods' romfs/ layers first — first root wins, so a
+// mod's file beats the base RomFS's and an earlier mod beats a later one — then env.txt's DM_ROMFS_OVERLAY as a fallback root. A mod is a folder in the
+// files folder's romfs_mods/, or an absolute path a hand edit kept. Only the game's RomFS is overlaid: exefs code mods (.pchtxt) do not apply at run time ----
+static void mods_apply(void) {
+    md_refresh(0);   // settings.txt's rows + romfs_mods/'s folders, as the panel lists them
+    if (!g_md.n) return;   // no mods: env.txt's DM_ROMFS_OVERLAY (or none) stands
+    char all[4096]; size_t len = 0; int used = 0, bad = 0; char mods[512]; md_dir(mods, sizeof mods);
+    for (int k = 0; k < g_md.n; k++) {
+        if (!g_md.e[k].on) continue;
+        const char *p = g_md.e[k].path; struct stat st; char root[400];
+        if (strchr(p, '/')) {   // an absolute path: a hand edit, or a mod kept elsewhere; its romfs/ layer is what the game reads
+            snprintf(root, sizeof root, "%s", p);
+            if (strcmp(md_base(p), "romfs")) { char sub[420]; snprintf(sub, sizeof sub, "%s/romfs", p); if (!stat(sub, &st) && S_ISDIR(st.st_mode)) snprintf(root, sizeof root, "%s", sub); }
+        }
+        else {
+            snprintf(root, sizeof root, "%s/%s/romfs", mods, p);
+            if (stat(root, &st) || !S_ISDIR(st.st_mode)) { snprintf(root, sizeof root, "%s/%s", mods, p); LOG("[mods] %s: no romfs/ layer; the folder itself is the root", p); }
+        }
+        if (stat(root, &st) || !S_ISDIR(st.st_mode)) { LOG("[RED] [mods] %s: not there or not readable: a folder moved or renamed, or All files access is missing; left out", p); bad++; continue; }
+        if (len + strlen(root) + 2 >= sizeof all) { LOG("[RED] [mods] the overlay's roots do not all fit (4 KB): later ones left out"); break; }
+        len += (size_t)snprintf(all + len, sizeof all - len, "%s%s", len ? ":" : "", root); used++;
+        LOG("[mods] %d: %s (%s)", used, root, p);
+    }
+    const char *e = getenv("DM_ROMFS_OVERLAY");   // the player's manual env.txt value: kept, after the mods (a mod wins)
+    if (e && *e && len + strlen(e) + 2 < sizeof all && !strstr(all, e)) { len += (size_t)snprintf(all + len, sizeof all - len, "%s%s", len ? ":" : "", e); LOG("[mods] env.txt's DM_ROMFS_OVERLAY kept as a fallback root"); }
+    if (used) { setenv("DM_ROMFS_OVERLAY", all, 1); LOG("[mods] %d mod folder(s)%s in DM_ROMFS_OVERLAY (first wins)", used, bad ? ", some left out" : ""); }
+}
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_size) {
     (void)saved; (void)saved_size;
     g_act = act;
@@ -1404,14 +1725,14 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
-    { const char *e = getenv("DM_MENU_BUTTON"); if (e && *e && !atoi(e)) { atomic_store(&g_menu_btn, 0); LOG("[overlay] DM_MENU_BUTTON=0: no menu button (Back opens the menu)"); } }
+    { const char *e = getenv("DM_MENU_BUTTON"); if (e && *e && !atoi(e)) { atomic_store(&g_menu_btn, 0); LOG("[overlay] DM_MENU_BUTTON=0: no menu button (Back opens the menu)"); } g_menu_btn_env = atomic_load(&g_menu_btn); }
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     if (!romfs_readable(act, sdk)) { g_quit = 1; return; }   // after the save manager's requests, which need no RomFS
-    settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
+    settings_load(); mods_apply(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); dm_lan_android_start(act);
     g_vm = act->vm;
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     { pthread_t w; if (!pthread_create(&w, NULL, temp_watch, act->vm)) pthread_detach(w); }

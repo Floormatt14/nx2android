@@ -374,8 +374,8 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 }
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
-static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Face buttons", "Audio output", "Resume", ""};
-static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_AUDIO] = "Select"};   // the rows that are a button: its word
+static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Face buttons", "Menu button", "Audio output", "Mods", "Resume", ""};
+static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_AUDIO] = "Select", [OVM_MODS] = "Manage"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
 static void ov_menu_panel(const ov_canvas *cv, int st) {
@@ -427,7 +427,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
             cv_rrect(cv, x0 + cur * segw, cy - hh / 2, x0 + (cur + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
             for (int k = 0; k < 2; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(seg[k], is)) / 2, cy, seg[k], is, k == cur ? C_WHITE : C_DIM);
         } else {   // a switch
-            int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : 3) & 1; float sx0 = x1 - sw;
+            int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : it == OVM_MENUBTN ? 29 : 3) & 1; float sx0 = x1 - sw;
             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
             cv_disc(cv, on ? x1 - sh / 2 : sx0 + sh / 2, cy, sh / 2 - fmaxf(2, sh * 0.1f), on ? C_WHITE : C_KNOB_OFF);
             const char *word = on ? "ON" : "OFF"; cv_text(cv, sx0 - gap - cv_text_w(word, is), cy, word, is, on ? C_WHITE : C_DIM);
@@ -489,11 +489,53 @@ static void ov_save_panel(const ov_canvas *cv, int st) {
         if (q->style == OVS_TITLE) cv_rrect(cv, r[0], r[1] + rh - 1, r[0] + rw, r[1] + rh, 0.5f, C_LINE);
     }
 }
+// The mods manager (overlay_layout.h OVMOD_*): the menu panel's rows, as front_android.c fills them (dm_mods_rows) — the list or the browser, drawn exactly
+// as the save picker's are. The paged title's chevron rects are published for the front end's hit test (dm_pager_rects), so the touched pixels are the drawn ones
+static float g_pager_lt[4], g_pager_gt[4]; static int g_pager_ok;   // raster pixels; the panel's raster is the window's panel rectangle at half scale
+int dm_pager_rects(float lt[4], float gt[4]) { memcpy(lt, g_pager_lt, sizeof g_pager_lt); memcpy(gt, g_pager_gt, sizeof g_pager_gt); return g_pager_ok; }
+static void ov_mods_panel(const ov_canvas *cv, int st) {
+    ov_srow rows[OVM_ROWS]; if (!dm_mods_rows(rows)) { g_pager_ok = 0; return; }
+    float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
+    float rh = r[3], rw = r[2], gap = rh * 0.35f, room = rw - rh * 0.3f; int sel = (st >> 4 & 15) - 1, is0 = (int)fmaxf(1, roundf(rh * 0.30f / PF_CAP)), size[OVS_BACK + 1];
+    for (int k = 0; k <= OVS_BACK; k++) size[k] = k == OVS_NOTE ? (int)fmaxf(1, roundf(is0 * 0.8f)) : is0;
+    size[OVS_TITLE] = is0 + 2;   // the title row and its pager, two larger than the panel's other text (the fit below shrinks it back when a long row needs the room)
+    g_pager_ok = 0;
+    for (int row = 0; row < OVM_ROWS; row++) { const ov_srow *q = &rows[row]; int *s = &size[q->style];
+        int paged = q->style == OVS_TITLE && !strncmp(q->right, "page ", 5);   // a paged title also fits its right-aligned pager: < page 1 of 2 >, two larger than the title's text
+        float need; if (paged) { int ps = *s + 2; need = cv_text_w(q->left, *s) + 2 * cv_text_w("<", ps) + 2 * gap + cv_text_w(q->right, ps); }
+        else need = cv_text_w(q->left, *s) + (q->right[0] ? gap + cv_text_w(q->right, *s) : 0);
+        while (*s > 1 && need > room) { --*s; if (paged) { int ps = *s + 2; need = cv_text_w(q->left, *s) + 2 * cv_text_w("<", ps) + 2 * gap + cv_text_w(q->right, ps); }
+                                       else need = cv_text_w(q->left, *s) + (q->right[0] ? gap + cv_text_w(q->right, *s) : 0); } }
+    cv_rrect(cv, 0, 0, p[2], p[3], rh * 0.18f, C_BG);
+    for (int row = 0; row < OVM_ROWS; row++) {
+        const ov_srow *q = &rows[row]; ov_menu_rowrect(p, row, r); float cy = r[1] + rh / 2, x0 = r[0] + rh * 0.15f, x1 = r[0] + rw - rh * 0.15f;
+        if (q->style == OVS_EMPTY) continue;
+        int is = size[q->style];
+        if (row == sel) cv_rrect(cv, r[0], r[1] + rh * 0.08f, r[0] + rw, r[1] + rh * 0.92f, rh * 0.14f, C_HI);
+        if (q->style == OVS_BACK) { cv_rrect(cv, r[0], r[1], r[0] + rw, r[1] + 1, 0.5f, C_LINE); cv_text(cv, r[0] + (rw - cv_text_w(q->left, is)) / 2, cy, q->left, is, C_ACCENT); continue; }
+        if (q->style == OVS_BUTTON) { float bw = fminf(rw, cv_text_w(q->left, is) + 4 * gap), b[4] = {r[0] + (rw - bw) / 2, cy - rh * 0.34f, bw, rh * 0.68f}; cv_button(cv, b, q->left, 1, row == sel); continue; }
+        int paged = q->style == OVS_TITLE && !strncmp(q->right, "page ", 5);   // a paged title: its pager sits right-aligned as < page 1 of 2 >, the chevrons themselves are the touch targets
+        cv_text(cv, x0, cy, q->left, is, q->style == OVS_TITLE || row == sel ? C_WHITE : C_DIM);
+        if (q->right[0] && !paged) cv_text(cv, x1 - cv_text_w(q->right, is), cy, q->right, is, C_DIM);
+        if (paged) {
+            int cur, np;
+            if (sscanf(q->right, "page %d of %d", &cur, &np) == 2 && np > 1) {
+                int ps = is + 2; float lt[4], pt[4], gt[4]; ov_menu_pager(r, ps, cv_text_w(q->right, ps), cv_text_w("<", ps), lt, pt, gt);
+                memcpy(g_pager_lt, lt, sizeof lt); memcpy(g_pager_gt, gt, sizeof gt); g_pager_ok = 1;   // the front end's hit test taps exactly these rects (dm_pager_rects)
+                cv_text(cv, lt[0] + (lt[2] - cv_text_w("<", ps)) / 2, cy, "<", ps, cur > 1 ? C_ACCENT : C_OFF);
+                cv_text(cv, pt[0], cy, q->right, ps, C_WHITE);
+                cv_text(cv, gt[0] + (gt[2] - cv_text_w(">", ps)) / 2, cy, ">", ps, cur < np ? C_ACCENT : C_OFF);
+            }
+        }
+        if (q->style == OVS_TITLE) cv_rrect(cv, r[0], r[1] + rh - 1, r[0] + rw, r[1] + rh, 0.5f, C_LINE);
+    }
+}
 static void ov_panel(int st) {   // the pause menu, the text entry or the layout editor, for menu state st (dm_menu_state), into the panel's rows of the upload buffer
     ov_canvas cv = {g_ov.px, g_ov.w, 0, g_ov.h + g_ov.sh, g_ov.pw, g_ov.ph};
     for (uint32_t y = 0; y < g_ov.ph; y++) memset(g_ov.px + 4 * ((size_t)(cv.y0 + y) * g_ov.w), 0, (size_t)g_ov.pw * 4);
     if (st >> 16 & 1) ov_text_panel(&cv);   // a text entry is open (dm_menu_state)
     else if (st & OVE_ST) ov_edit_panel(&cv, st, (float)g_sext.width, (float)g_sext.height);
+    else if (st & OVMOD_ST) ov_mods_panel(&cv, st);
     else if (st & OVS_ST) ov_save_panel(&cv, st);
     else ov_menu_panel(&cv, st);
 }
@@ -510,6 +552,7 @@ JNIEXPORT jintArray JNICALL Java_org_nx2a_ExternalActivity_externalMenuPixels(JN
     ov_canvas cv = {pixels, w, 0, 0, w, h};
     if (st & 0x10000) ov_text_panel(&cv);
     else if (st & OVE_ST) ov_edit_panel(&cv, st, (float)W, (float)H);
+    else if (st & OVMOD_ST) ov_mods_panel(&cv, st);
     else if (st & OVS_ST) ov_save_panel(&cv, st);
     else ov_menu_panel(&cv, st);
     size_t count = (size_t)w * h; jint *argb = malloc((count + 2) * sizeof *argb);
