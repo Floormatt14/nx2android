@@ -55,6 +55,15 @@ def _parser():
     _romfs_at(po, 'with --install: ')
     po.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
+    u = sub.add_parser('update', help="a port's data pack, made again from its build folder without the dump (the stages that need no game files run again); --install pushes it")
+    u.add_argument('pack', help='the data pack folder (<App>-data), or the out folder that holds exactly one')
+    u.add_argument('--install', action='store_true', help='push the re-emitted pack and install its APK when the stages are done')
+    u.add_argument('--device', default='', help='adb serial (default: the configured one, or the only device)')
+    u.add_argument('--replace-signer', action='store_true', help='uninstall an app of the same package signed with another key')
+    u.add_argument('-k', '--keys', help='prod.keys (default: the configured one)')
+    u.add_argument('-j', '--jobs', type=int, help='build jobs (default: the CPU count)')
+    u.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
+    _romfs_at(u)
     ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
     ins.add_argument('--device', default=''); ins.add_argument('--replace-signer', action='store_true'); ins.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
     _romfs_at(ins)
@@ -177,6 +186,15 @@ def cmd_port(a):
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
+def cmd_update(a):
+    from porter import pipeline
+    def go():
+        o = pipeline.Options(folder=Path.cwd(), keys=Path(a.keys) if a.keys else None, install=a.install, device=a.device, replace_signer=a.replace_signer,
+                             romfs_at=a.romfs_at, romfs_push=a.romfs_push)
+        if a.jobs: o.jobs = a.jobs
+        pipeline.Port(o).update(a.pack)
+    return _with_progress(a.progress, go)
+
 def cmd_install(a):
     from porter import config, datapack, install, toolchain
     from porter.upstream import BuildError, PROG
@@ -282,4 +300,4 @@ def cmd_driver(a):   # porter driver and porter host: the installed APK rebuilt 
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'update': cmd_update, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'driver': cmd_driver, 'host': cmd_driver}[a.cmd](a)

@@ -290,11 +290,21 @@ class Port:
             if self.derived: say(f'{self.derived}: packing {self.pkg_ver} from a profile derived from it')
         self.versions = [self.pkg_ver] if self.derived else need + ([self.pkg_ver] if self.pkg_ver not in need else [])
         self.have = have
+        self.record_scan()
         self.check_space()
         self.aw = self.work / 'android'; self.logs = self.work / 'logs'
         for d in (self.aw, self.logs, self.work / 'tmp'): d.mkdir(parents=True, exist_ok=True)
         # DM_GAME picks the profile for every tool; WORK keeps their temporary folders inside the build folder (the shader translator writes thousands of files)
         self.env.update(DM_GAME=g.id, DM_ROOT=str(self.work), WORK=str(self.work / 'tmp'))
+
+    def record_scan(self):
+        """The scan in the build folder (scan.json): porter update knows the folder's titles, versions and DLC — and the dumps'
+        names, sizes and mtimes, which the DLC stage's reuse key fingerprints — without a scan (which reads the dumps)"""
+        f = lambda p: dict(name=p.name, size=p.stat().st_size, mtime=p.stat().st_mtime_ns)
+        scan = dict(title_id=f'{self.app:016X}', versions=sorted(self.have, key=nsp.vnum), base=f(self.fam['base']),
+                    updates=[dict(version=v, **f(p)) for v, p in self.fam['updates']],
+                    dlc=[dict(title_id=f'{t:016X}', version=v, **f(p)) for t, v, p in self.fam['dlc']])
+        (self.work / 'scan.json').write_text(json.dumps(scan, indent=2), encoding='utf-8')
 
     def check_space(self):
         """Stop before extracting when the game folder's drive cannot hold the port: a build folder takes about 1 to 2 times the game files (NEO 7.0 GB of 6.8,
@@ -854,7 +864,7 @@ class Port:
                              aoc=self.aoc, sysdata=self.sysdata, language=self.lang, package=self.package, env=self.fps_env + font_env + zenv + (['DM_VK_MT_REPLAY=1'] if self.o.mt_replay else [])
                              + (['DM_MENU_BUTTON=0'] if self.o.no_menu_button else [])
                              + ([f'DM_VK_DRIVER={driver_lib_name(self.o.vulkan_driver)}'] if self.o.vulkan_driver else []), settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None),
+                             files={**self.fps_files, **font_files}, profile_h=getattr(self, 'profile_h', None), app_name=self.app_name, work=self.work,
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result['data'] = str(dst)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')
@@ -880,6 +890,93 @@ class Port:
     def install(self):
         install.install(self.apk_path, self.data_path, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer,
                         romfs_at=self.o.romfs_at, romfs_push=self.o.romfs_push)
+
+    # ---- update: a port's data pack, made again from its build folder without the dump ----
+    def find_work(self, pack, man, tid):
+        """The build folder the pack was made from: where the manifest records it, else beside the pack"""
+        w = man.get('work')
+        if w and Path(w).is_dir(): return Path(w)
+        for c in (pack.parent / f'{tid}_build', pack / f'{tid}_build'):
+            if c.is_dir(): return c
+        raise BuildError(f'the build folder ({tid}_build) is neither where the pack recorded it ({w or "nowhere"}) nor beside the pack: port with the dump once more, or move the build folder where the pack can find it')
+
+    def read_scan(self, work, tid):
+        p = work / 'scan.json'
+        if not p.is_file(): raise BuildError(f'{work} has no scan.json (a build folder this porter did not write): port with the dump once more to record it')
+        try: scan = json.loads(p.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as e: raise BuildError(f'{p} does not read as JSON ({e}): delete it and port with the dump once more')
+        if scan.get('title_id') != tid: raise BuildError(f'{p} records {scan.get("title_id")}, the pack is for {tid}: port again')
+        return scan
+
+    def update(self, pack):
+        """porter update: a finished port's data pack, made again from its build folder without the game's dump. The recorded scan
+        (scan.json) says which titles the folder held; the receipts reuse every stage whose inputs are unchanged; the scan and the
+        extraction never run — their outputs are the build folder's, and when those are gone the error says to port with the dump.
+        --install pushes the re-emitted pack and its APK when the stages are done"""
+        o = self.o
+        pack = Path(pack).expanduser().resolve()
+        man = datapack.read_manifest(pack)
+        if not man:
+            packs = sorted(p for p in pack.glob('*-data') if (p / datapack.MANIFEST).is_file()) if pack.is_dir() else []
+            if len(packs) == 1: pack, man = packs[0], datapack.read_manifest(packs[0])
+            elif len(packs) > 1: raise BuildError(f'{pack} holds several data packs: give one ({", ".join(p.name for p in packs)})')
+            else: raise BuildError(f'not a data pack (no {datapack.MANIFEST}): {pack}')
+        tid = man.get('title_id') or ''
+        if not re.fullmatch(r'[0-9a-fA-F]{16}', tid): raise BuildError(f'{pack}: {datapack.MANIFEST} has no title ID')
+        work = self.find_work(pack, man, tid)
+        scan = self.read_scan(work, tid)
+        g, ap = profiles.by_title(int(tid, 16))
+        if not (g and ap): raise BuildError(f'no ported game profile for {tid}: porter update rebuilds from the repository\'s profile')
+        builds = g.builds()
+        self.pkg_ver = man.get('version') or ''
+        if self.pkg_ver not in builds: raise BuildError(f'{self.pkg_ver} is not a version game profile {g.id} registers ({", ".join(sorted(builds))}): a derived profile needs a port with the dump')
+        say(f'updating {pack.name} ({man.get("display")}, made {man.get("made")}) from {work}: the scan and the extraction do not run')
+        self.g, self.ap, self.provisional, self.derived, self.derived_mem, self.lost = g, ap, False, '', '', []
+        need = g.words('shader_versions')
+        self.versions = need + ([self.pkg_ver] if self.pkg_ver not in need else [])
+        self.package = o.package or man.get('package') or ap.package
+        self.app_name = o.app_name or man.get('app_name') or pack.name.removesuffix('-data')
+        self.display = man.get('display') or '1.0'
+        self.lang = man.get('language') or 'en-US'
+        self.work, self.aw, self.logs = work, work / 'android', work / 'logs'
+        (work / 'tmp').mkdir(parents=True, exist_ok=True)
+        keys = o.keys or self.cfg.get('keys')
+        if keys: o.keys = Path(keys).expanduser().resolve()
+        self.tools = toolchain.require(self.cfg, str(o.keys) if o.keys else None, adb=o.install)
+        os.environ['PATH'] = os.pathsep.join([str(self.tools['dotnet'].parent), os.environ.get('PATH', '')])
+        os.environ['DOTNET_ROOT'] = str(toolchain.dotnet_root(self.tools['dotnet']))
+        self.env = dict(os.environ, J=str(o.jobs), PYTHONIOENCODING='utf-8', PYTHONUTF8='1', DOTNET_CLI_TELEMETRY_OPTOUT='1',
+                        DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'))
+        o.out = pack.parent   # the rebuilt APK lands beside the pack, and the pack is re-emitted in place
+        self.dirs = {}
+        for v in self.versions:
+            d = work / 'extract' / v
+            if not ((d / 'ExeFS' / 'main').is_file() and (d / 'RomFS' / g.get('romfs_marker')).is_file()):
+                raise BuildError(f'the extracted {v} is missing or incomplete in {work / "extract"}: porter update does not extract; port with the dump once more')
+            self.dirs[v] = d
+        self.game = self.dirs[self.pkg_ver]
+        def has_upd(v): return any(u.get('version') == v and u.get('name') != scan['base'].get('name') for u in scan.get('updates', []))
+        self.base = next((self.dirs[v] for v in self.versions if not has_upd(v)), self.dirs[self.versions[0]])
+        self.aoc = work / 'aoc' if (work / 'aoc').is_dir() else None
+        if scan.get('dlc') and not self.aoc: raise BuildError(f'the extracted DLC is missing ({work / "aoc"}): port with the dump once more')
+        if man.get('sysdata'):
+            self.sysdata = work / 'sysdata'
+            if not self.sysdata.is_dir(): raise BuildError(f'the extracted system data is missing ({self.sysdata}): port with the dump and --firmware once more')
+        else: self.sysdata = None
+        PROG.plan(6 + bool(o.fps60) + bool(o.install))   # rewrite / shader split / Vulkan shaders / host / APK / data; 60 fps and install add their own
+        self.check_graphics()
+        self.fps_unlock()
+        self.rewrite()
+        self.shaders()
+        self.host()
+        self.apk()
+        self.data()
+        if o.install: self.install()
+        nsp.rmtree(self.work / 'tmp')
+        self.result.update(title_id=self.g.id, name=self.app_name, package=self.package, version=self.pkg_ver, display=self.display, language=self.lang,
+                           status=self.ap.status, derived=False, installed=bool(o.install))
+        say(f'done: {self.result["apk"]} and {self.result["data"]}')
+        return self.result
 
 
 def emit_result(r):   # the last JSON event of a port (the GUI's done screen); a summary line in the other modes
