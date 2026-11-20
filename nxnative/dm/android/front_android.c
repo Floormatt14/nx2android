@@ -856,7 +856,36 @@ static const char *const MD_BOOKMARKS[][2] = {   // name, where (NULL: the app's
 static void md_changed(void) { atomic_fetch_add(&g_md_ver, 1); dm_overlay_redraw(); }
 static const char *md_base(const char *p) { const char *b = strrchr(p, '/'); return b && b[1] ? b + 1 : p; }
 static void md_dir(char *out, size_t cap) { snprintf(out, cap, "%s/romfs_mods", g_root); }
-static struct { int n, page, ptr, row; char dir[1024]; struct { char name[96]; char to[128]; int romfs; } ls[64]; } g_md_v = {.ptr = -1};   // the list's or the browser's page; the browser's directory ("" the bookmarks), its folders and their count
+// The mod folder whose exefs/ code layer applies at load time (mods_apply, dm_mods_rows): the row's path when it has an
+// exefs/ itself, the folder above a row pointing at the romfs layer, or romfs_mods/<name>; 1 when such a folder exists
+static int md_code_dir(const char *path, char *out, size_t cap) {
+    char mods[512]; md_dir(mods, sizeof mods); struct stat st;
+    if (strchr(path, '/')) {   // an absolute row
+        if (!strcmp(md_base(path), "romfs")) {
+            char up[600]; snprintf(up, sizeof up, "%.*s", (int)(strlen(path) - 5), path);   // the row minus "romfs"
+            size_t l = strlen(up); if (l && up[l - 1] == '/') up[l - 1] = 0;
+            snprintf(out, cap, "%s", up);
+        } else snprintf(out, cap, "%s", path);
+    } else snprintf(out, cap, "%s/%s", mods, path);
+    char sub[700]; snprintf(sub, sizeof sub, "%s/exefs", out);
+    if (stat(sub, &st) || !S_ISDIR(st.st_mode)) return 0;
+    DIR *d = opendir(sub); if (!d) return 0;
+    int ok = 1; struct dirent *e;
+    while (ok && (e = readdir(d))) {   // a whole-module replacement for a module the port does not load: the layer is incomplete
+        size_t nl = strlen(e->d_name); const char *nm = e->d_name;
+        if (nl > 4 && (!strcasecmp(nm + nl - 4, ".ips") || (nl > 6 && !strcasecmp(nm + nl - 6, ".ips32")) || (nl > 7 && !strcasecmp(nm + nl - 7, ".pchtxt")))) continue;
+        char p[900]; snprintf(p, sizeof p, "%s/%s", sub, nm);
+        if (stat(p, &st) || !S_ISREG(st.st_mode)) continue;
+        FILE *f = fopen(p, "rb"); if (!f) continue; uint8_t m4[4] = {0}; size_t r = fread(m4, 1, 4, f); fclose(f);
+        if (r != 4 || memcmp(m4, "NSO0", 4)) continue;
+        char stem[64], chk[600]; snprintf(stem, sizeof stem, "%.*s", (int)nl, nm);
+        snprintf(chk, sizeof chk, "%s/mods/%s.fixups.tsv", g_root, stem);
+        if (stat(chk, &st) || !S_ISREG(st.st_mode)) ok = 0;
+    }
+    closedir(d);
+    return ok;
+}
+static struct { int n, page, ptr, row; char dir[1024]; struct { char name[96]; char to[128]; int romfs, code; } ls[64]; } g_md_v = {.ptr = -1};   // the list's or the browser's page; the browser's directory ("" the bookmarks), its folders and their count
 static void md_scan(void) {   // the bookmarks, or the current directory's folders, in name order; a folder with a romfs/ layer is marked (the caller holds g_md_mu)
     g_md_v.n = 0;
     if (!g_md_v.dir[0]) {   // the bookmarks
@@ -867,18 +896,20 @@ static void md_scan(void) {   // the bookmarks, or the current directory's folde
             snprintf(g_md_v.ls[g_md_v.n].name, sizeof g_md_v.ls[0].name, "%s", MD_BOOKMARKS[k][0]);
             snprintf(g_md_v.ls[g_md_v.n].to, sizeof g_md_v.ls[0].to, "%s", to);
             snprintf(sub, sizeof sub, "%s/romfs", to); g_md_v.ls[g_md_v.n].romfs = !stat(sub, &st) && S_ISDIR(st.st_mode);
+            snprintf(sub, sizeof sub, "%s/exefs", to); g_md_v.ls[g_md_v.n].code = !stat(sub, &st) && S_ISDIR(st.st_mode);
             g_md_v.n++;
         }
         return;
     }
     struct dirent **ents = NULL; int k = scandir(g_md_v.dir, &ents, NULL, alphasort);
     for (int i = 0; i < k; i++) {
-        char sub[1100]; struct stat st;
-        snprintf(sub, sizeof sub, "%s/%s", g_md_v.dir, ents[i]->d_name);
-        if (!stat(sub, &st) && S_ISDIR(st.st_mode) && g_md_v.n < (int)(sizeof g_md_v.ls / sizeof g_md_v.ls[0])) {
+        char d2[1100], sub[1100]; struct stat st;
+        snprintf(d2, sizeof d2, "%s/%s", g_md_v.dir, ents[i]->d_name);
+        if (!stat(d2, &st) && S_ISDIR(st.st_mode) && g_md_v.n < (int)(sizeof g_md_v.ls / sizeof g_md_v.ls[0])) {
             snprintf(g_md_v.ls[g_md_v.n].name, sizeof g_md_v.ls[0].name, "%s", ents[i]->d_name);
             g_md_v.ls[g_md_v.n].to[0] = 0;
-            snprintf(sub, sizeof sub, "%s/romfs", sub); g_md_v.ls[g_md_v.n].romfs = !stat(sub, &st) && S_ISDIR(st.st_mode);
+            snprintf(sub, sizeof sub, "%s/romfs", d2); g_md_v.ls[g_md_v.n].romfs = !stat(sub, &st) && S_ISDIR(st.st_mode);
+            snprintf(sub, sizeof sub, "%s/exefs", d2); g_md_v.ls[g_md_v.n].code = !stat(sub, &st) && S_ISDIR(st.st_mode);
             g_md_v.n++;
         }
         free(ents[i]);
@@ -1090,6 +1121,7 @@ int dm_mods_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_mods_panel)
         for (int j = 0; j < k; j++) {
             MD_ROW(1 + j, OVS_ITEM, "%s", g_md_v.ls[g_md_v.page * MD_PER + j].name);
             if (g_md_v.ls[g_md_v.page * MD_PER + j].romfs) snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "romfs");
+            else if (g_md_v.ls[g_md_v.page * MD_PER + j].code) snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "code");
         }
         MD_ROW(OVM_ROWS - 3, OVS_BUTTON, "Browse all folders"); MD_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
     } else {
@@ -1099,6 +1131,7 @@ int dm_mods_rows(ov_srow rows[OVM_ROWS]) {   // (gfx_vk_present.c ov_mods_panel)
         for (int j = 0; j < k; j++) {
             MD_ROW(1 + j, OVS_ITEM, "%s", g_md_v.ls[g_md_v.page * MD_PER + j].name);
             if (g_md_v.ls[g_md_v.page * MD_PER + j].romfs) snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "romfs");
+            else if (g_md_v.ls[g_md_v.page * MD_PER + j].code) snprintf(rows[1 + j].right, sizeof rows[1 + j].right, "code");
         }
         MD_ROW(OVM_ROWS - 3, OVS_BUTTON, "Choose this folder"); MD_ROW(OVM_ROWS - 2, OVS_BUTTON, "Up one folder"); MD_ROW(OVM_ROWS - 1, OVS_BACK, "Back");
     }
@@ -1699,6 +1732,17 @@ static void mods_apply(void) {
     const char *e = getenv("DM_ROMFS_OVERLAY");   // the player's manual env.txt value: kept, after the mods (a mod wins)
     if (e && *e && len + strlen(e) + 2 < sizeof all && !strstr(all, e)) { len += (size_t)snprintf(all + len, sizeof all - len, "%s%s", len ? ":" : "", e); LOG("[mods] env.txt's DM_ROMFS_OVERLAY kept as a fallback root"); }
     if (used) { setenv("DM_ROMFS_OVERLAY", all, 1); LOG("[mods] %d mod folder(s)%s in DM_ROMFS_OVERLAY (first wins)", used, bad ? ", some left out" : ""); }
+    // the same rows' code layers (dm/host/mods_code.c): the folders' exefs/ patches apply at load time, build-ID gated
+    char code[2048]; size_t clen = 0; int cused = 0;
+    for (int k = 0; k < g_md.n; k++) {
+        if (!g_md.e[k].on) continue;
+        char f[600]; if (!md_code_dir(g_md.e[k].path, f, sizeof f)) continue;
+        int dup = 0; for (char *s = code; s < code + clen && *s; ) { char *c = strchr(s, ':'); if (!c) c = code + clen; if ((int)strlen(f) == c - s && !strncmp(s, f, (size_t)(c - s))) { dup = 1; break; } s = c + 1; }
+        if (dup) continue;
+        if (clen + strlen(f) + 2 >= sizeof code) { LOG("[RED] [mods] DM_CODE_MODS does not fit all the code mods: later ones left out"); break; }
+        clen += (size_t)snprintf(code + clen, sizeof code - clen, "%s%s", clen ? ":" : "", f); cused++;
+    }
+    if (cused) { setenv("DM_CODE_MODS", code, 1); LOG("[mods] %d code mod folder(s) in DM_CODE_MODS", cused); }
 }
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_size) {
     (void)saved; (void)saved_size;

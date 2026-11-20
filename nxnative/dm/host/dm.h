@@ -70,6 +70,8 @@ extern module_t g_mod[MAX_MOD];
 extern int g_nmod;
 // main's build ID (empty if none): code with fixed addresses in a game's module runs only on the build they were found in
 static inline const char *dm_main_build(void) { for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) return g_mod[i].build_id; return ""; }
+void mods_code_apply(module_t *m, const char *dir, const char **names, int nn);   // mods_code.c: the Mods panel's exefs code layers onto the mapped image, pre-seal (Android); names are the port's modules
+void mods_code_seal(module_t *m);                     // mods_code.c: after the seal, mod-written pages stay RWX (DM_MODS_RWX=0 seals them)
 // Four thread-local slots: K18 = the Switch's x18, KTLS = tpidr_el0, KTLR = tpidrro_el0 (ThreadLocalRegion), KGATE = host gate entry; the actual key numbers are written into the key page by the loader
 extern pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
 // The guest thread slots the rewritten code reads (patch_nso.py emit_tp): Darwin TSD keys on Apple; on Android the keys are indices into a per-thread

@@ -377,7 +377,7 @@ static void relocate(module_t *m) {
 // loads it. A load restores the NRO's data and bss as rewritten (after the first), relocates it against the modules loaded then, in load order (Horizon's rtld does the same), and binds the
 // symbol relocations of the modules loaded before it that it defines and nothing loaded defined (Horizon: BindVariables, and functions bound lazily at their first call): main's lua2cpp
 // imports are stubs until then. Only data is written, so the same works with code embedded in the iOS executable. An unload binds every relocation that pointed into the NRO again
-static void map_image(module_t *m, const char *dir);
+static void map_image(module_t *m, const char *dir, const char **names, int nn);
 static uint8_t g_refused[16][32]; static int g_nrefused;   // NROs the pack refused (online SDKs, nro.tsv rows named "refused")
 int nro_refused(const uint8_t sha256[32]) {
     for (int i = 0; i < g_nrefused && i < 16; i++) if (!memcmp(g_refused[i], sha256, 32)) return 1;
@@ -402,7 +402,7 @@ static void preload_nros(const char *dir) {
         module_t *m = &g_mod[g_nmod];
         strlcpy(m->name, name, sizeof m->name); m->nro = 1; m->nro_size = size;
         for (int k = 0; k < 32; k++) sscanf(hex + 2 * k, "%2hhx", &m->sha256[k]);
-        read_layout(m, dir); map_image(m, dir); parse_dynamic(m); register_gates(m, dir);
+        read_layout(m, dir); map_image(m, dir, NULL, 0); parse_dynamic(m); register_gates(m, dir);
         m->pristine_len = m->key_page_off - m->data_off;
         if (!(m->pristine = malloc(m->pristine_len))) die("%s: pristine data copy", m->name);
         memcpy(m->pristine, m->base + m->data_off, m->pristine_len); data += m->pristine_len;
@@ -531,7 +531,7 @@ static int nro_pieces(const char *name, const uint8_t **x0, unsigned long *z0, c
     }
     return 0;
 }
-static void map_image(module_t *m, const char *dir) {
+static void map_image(module_t *m, const char *dir, const char **names, int nn) {  // (names/nn: Apple does not apply code mods)
     (void)dir;
     char sx0[17], sx1[17], dm[17]; snprintf(sx0, sizeof sx0, "__dm%sx0", m->name); snprintf(sx1, sizeof sx1, "__dm%sx1", m->name); snprintf(dm, sizeof dm, "__DM%sW", m->name);
     unsigned long z0 = 0, zw = 0, z1 = 0;
@@ -566,7 +566,7 @@ static uint8_t *slurp(const char *path, size_t *n) {
 
 // Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
 // what lies between (ro and data on the same page can only go together) is writable
-static void map_image(module_t *m, const char *dir) {
+static void map_image(module_t *m, const char *dir, const char **names, int nn) {  // (names/nn: Apple does not apply code mods)
     char path[1024]; snprintf(path, sizeof path, "%s/%s.patched.bin", dir, m->name);
     size_t sz; uint8_t *raw = slurp(path, &sz);
     if (m->patch_off < 0) {
@@ -579,20 +579,24 @@ static void map_image(module_t *m, const char *dir) {
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - fl); free(raw); install_key_page(m);
+        mods_code_apply(m, dir, names, nn);   // the Mods panel's exefs code layers, while the image is still writable
         uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
         if (pre > m->patch_len && mprotect(a + m->patch_len, pre - m->patch_len, PROT_NONE)) die("%s mprotect gap", m->name);
+        mods_code_seal(m);   // mod-written pages stay RWX (dm/host/mods_code.c)
         return;
     }
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     m->base = mmap(NULL, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m);
+    mods_code_apply(m, dir, names, nn);   // the Mods panel's exefs code layers, while the image is still writable
     uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;
     if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
+    mods_code_seal(m);   // mod-written pages stay RWX (dm/host/mods_code.c)
 }
 #endif
 
@@ -608,7 +612,7 @@ void load_modules(const char *dir, const char **names, int n) {
     create_keys();
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];
-        t = now_ns(); map_image(m, dir); tm += now_ns() - t;   // On return the code area is already read-only+execute; from here on the loader only writes data
+        t = now_ns(); map_image(m, dir, names, n); tm += now_ns() - t;   // On return the code area is already read-only+execute; from here on the loader only writes data
         if (!i) tsd_check();
         t = now_ns(); parse_dynamic(m); tp += now_ns() - t;
         t = now_ns(); register_gates(m, dir); tg += now_ns() - t;
