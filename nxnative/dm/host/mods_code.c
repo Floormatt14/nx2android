@@ -145,7 +145,8 @@ static int parse_pchtxt(module_t *m, const char *file, const uint8_t *d, size_t 
     return 0;
 }
 
-// ---- .ips / .ips32: the whole file is one module's patches, named by its build ID ----
+// ---- .ips / .ips32: the whole file is one module's patches, named by its build ID. Records are Atmosphere ExeFS file
+// offsets: the 0x100-byte NSO header is cut off (mods_layer.py's bake does the same; .pchtxt records are image offsets and do not) ----
 static int parse_ips(const char *file, const uint8_t *d, size_t n, mrec **r, int *nr, int *cap) {
     int ol; size_t i;
     if (n > 5 && !memcmp(d, "IPS32", 5)) { ol = 4; i = 5; }
@@ -155,6 +156,8 @@ static int parse_ips(const char *file, const uint8_t *d, size_t n, mrec **r, int
         if (n - i == (size_t)ol && !memcmp(d + i, ol == 4 ? "EEOF" : "EOF", (size_t)ol)) break;
         if (i + (size_t)ol + 2 > n) return refuse(file, "truncated before a record's bytes");
         uint64_t off = 0; for (int k = 0; k < ol; k++) off = off << 8 | d[i + k]; i += (size_t)ol;
+        if (off < 0x100) return refuse(file, "a record patches the NSO header, not the memory image");
+        off -= 0x100;   // Atmosphere ExeFS IPS file offsets include the 0x100-byte NSO header; the image starts after it (mods_layer.py's bake cuts the same bias: the two halves' contract, verified against a real mod's .ips against its bake's rows)
         uint32_t ln = (uint32_t)(d[i] << 8 | d[i + 1]); i += 2;
         if (!ln) {   // RLE: one byte, then its run count
             if (i + 3 > n) return refuse(file, "truncated inside a run record");
