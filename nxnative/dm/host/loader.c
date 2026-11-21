@@ -140,13 +140,15 @@ void *guest_sym(const char *name) {
     return p;
 }
 // For modules with the patch area before the base (patch_off < 0) addresses in the patch area count too, as for modules whose patch area follows the image (crash reports, the GC pause's "in guest code" test)
+// A mod layout (MOD_BASE) nests the modules' [base, base+size) ranges inside one group: the most specific module wins (the highest base that holds the address), which without a layout is the same module as before (the ranges are disjoint)
 module_t *module_of(const void *p) {
+    module_t *hit = NULL;
     for (int i = 0; i < g_nmod; i++) {
         const uint8_t *b = g_mod[i].base;
-        if ((const uint8_t *)p >= b && (const uint8_t *)p < b + g_mod[i].size) return &g_mod[i];
-        if (g_mod[i].patch_off < 0 && (const uint8_t *)p >= b + g_mod[i].patch_off && (const uint8_t *)p < b + g_mod[i].patch_off + g_mod[i].patch_len) return &g_mod[i];
+        if ((const uint8_t *)p >= b && (const uint8_t *)p < b + g_mod[i].size) { if (!hit || g_mod[i].base > hit->base) hit = &g_mod[i]; continue; }
+        if (g_mod[i].patch_off < 0 && (const uint8_t *)p >= b + g_mod[i].patch_off && (const uint8_t *)p < b + g_mod[i].patch_off + g_mod[i].patch_len) { if (!hit || g_mod[i].base > hit->base) hit = &g_mod[i]; }
     }
-    return NULL;
+    return hit;
 }
 
 // Whether main imports a symbol whose name starts with prefix (an undefined dynamic symbol: one main calls but another module defines), for behaviour that follows what the game uses
@@ -227,6 +229,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
+        else if (!strcmp(key, "MOD_BASE")) { m->mod_base = strtoll(line + 2 + strlen(key), NULL, 16); m->has_mod_base = 1; }   // the mod layout: the module's image offset in the contiguous group image (group_reserve/map_image)
         else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
         else for (int k = 0; k < KEY_N; k++) {
             size_t n = strlen(kn[k]);
@@ -564,11 +567,84 @@ static uint8_t *slurp(const char *path, size_t *n) {
     close(fd); *n = st.st_size; return p;
 }
 
+// The mod layout (patch_nso.py DM_MOD_LAYOUT, a --mods port whose code branches straight between modules: the bake lays them out at the Switch's original relative
+// placement): each module's file = its image, then the gap to its tail slot (the other modules' spans), then the tail (key page, frame-step page, patch area), and
+// its fixups carry MOD_BASE, the module's image offset in the group. Mapping the files separately at arbitrary bases would leave every baked cross-module branch
+// pointing into the zero gap, so the group is mapped ONCE at one base and each module is copied to group + MOD_BASE: image piece first (up to the next module's
+// image or the first tail, whichever comes first — the gap is zeros and belongs to whichever module's span it covers), then the module's own tail. m->base stays
+// group + MOD_BASE and m->size the module's own file length, so every offset in the fixups and the tsv tables (patch areas, key pages, the runtime code mods'
+// protections) stays module-relative and works unchanged. The group's pages no module's file covers (the unused tail-slot space) go PROT_NONE after the seals.
+static uint8_t *g_group; static uint64_t g_group_size, g_group_used; static uint8_t *g_group_map; static uint64_t g_group_pages;
+#define GROUP_PAGE 0x4000ull
+static void group_reserve(module_t *mods, int n) {
+    int any = 0;
+    for (int i = 0; i < n; i++) if (mods[i].has_mod_base) any = 1;
+    if (!any) return;   // a pack without a mod layout maps as it always has
+    for (int i = 0; i < n; i++)
+        if (!mods[i].nro && !mods[i].has_mod_base) die("%s: the pack mixes layouts (the other modules' fixups carry MOD_BASE, this one's does not)", mods[i].name);
+    for (int i = 0; i < n; i++) {
+        if (mods[i].nro) continue;   // NROs carry no MOD_BASE (the layout covers the profile's modules) and map independently as always
+        uint64_t mb = (uint64_t)mods[i].mod_base, tail = mb + mods[i].key_page_off, lim = (uint64_t)-1;
+        for (int j = 0; j < n; j++) {
+            if (mods[j].nro) continue;
+            uint64_t mbj = (uint64_t)mods[j].mod_base, tailj = mbj + mods[j].key_page_off;
+            if (j != i) {
+                if (mbj == mb || (mbj > mb && mbj - mb < lim)) lim = mbj - mb;        // the next module's image starts here
+                if (mbj == mb) die("the mod layout puts %s and %s at the same MOD_BASE %#llx", mods[i].name, mods[j].name, (unsigned long long)mb);
+                if (tailj > mb && tailj - mb < lim) lim = tailj - mb;                // the first module's tail after this one
+                if (tailj >= tail && tailj - tail < mods[i].key_page_size) die("the mod layout's tail slots of %s and %s overlap", mods[i].name, mods[j].name);
+                if (mods[j].has_mod_base && tailj < tail && tail - tailj < mods[j].key_page_size) die("the mod layout's tail slots of %s and %s overlap", mods[i].name, mods[j].name);
+            }
+        }
+        mods[i].group_copy_lim = lim == (uint64_t)-1 ? tail - mb : lim;   // the last module copies its image up to its own tail (the gap holds the other modules' tails, which their own files bring)
+        uint64_t end = tail + 0x400000;   // the bake's per-module tail slot (DM_MOD_LAYOUT's 4 MB): patch_nso.py refuses a patch tail beyond it, so the file ends inside
+        if (end > g_group_size) g_group_size = end;
+    }
+    g_group = mmap(NULL, g_group_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (g_group == MAP_FAILED) die("the mod layout's group mmap %#llx", (unsigned long long)g_group_size);
+    g_group_pages = (g_group_size + GROUP_PAGE - 1) / GROUP_PAGE;
+    g_group_map = calloc(g_group_pages, 1);
+    if (!g_group_map) die("the mod layout's page map");
+    LOG("mod layout: %d module group at one base, %#llx bytes reserved", n, (unsigned long long)g_group_size);
+}
+static void group_seal(void) {
+    for (uint64_t p = 0; p < g_group_pages; p++)
+        if (!g_group_map[p]) { if (mprotect(g_group + p * GROUP_PAGE, GROUP_PAGE, PROT_NONE)) die("the mod layout's group gap mprotect at %#llx", (unsigned long long)(p * GROUP_PAGE)); }
+        else g_group_used++;
+    LOG("mod layout: the group's gaps are PROT_NONE (%#llx bytes reserved, %llu of %llu page(s) covered by the modules' files)", (unsigned long long)g_group_size, (unsigned long long)g_group_used, (unsigned long long)g_group_pages);
+}
+
 // Seal the code area immediately after copying into anonymous pages (16 KB pages): [0, text_end) and the patch area are read-only+execute, and from then on any write to the code area crashes on the spot;
 // what lies between (ro and data on the same page can only go together) is writable
 static void map_image(module_t *m, const char *dir, const char **names, int nn) {  // (names/nn: Apple does not apply code mods)
     char path[1024]; snprintf(path, sizeof path, "%s/%s.patched.bin", dir, m->name);
     size_t sz; uint8_t *raw = slurp(path, &sz);
+    if (m->has_mod_base) {   // the module's place in the group image (group_reserve); the file's pieces go to group + MOD_BASE, the zero gap left to whichever module's span it is
+        if (!g_group) die("%s: its fixups carry MOD_BASE but no mod layout group was reserved", m->name);
+        if (m->patch_off < 0) die("%s: a mod layout's patch area cannot sit before the base", m->name);
+        m->size = (sz + 0x3FFF) & ~0x3FFFull;
+        uint64_t mb = (uint64_t)m->mod_base;
+        if (mb + m->size > g_group_size) die("%s: %#llx bytes at MOD_BASE %#llx run past the reserved group of %#llx", m->name, (unsigned long long)(mb + m->size), (unsigned long long)mb, (unsigned long long)g_group_size);
+        for (int i = 0; i < g_nmod; i++) {   // a patch tail long enough to reach another module's tail slot would clobber it (the bake's rewriter refuses tails beyond the slot; this is the loader's backstop)
+            if (&g_mod[i] == m || g_mod[i].nro || !g_mod[i].has_mod_base) continue;
+            uint64_t tailj = (uint64_t)g_mod[i].mod_base + g_mod[i].key_page_off;
+            if (tailj >= mb + m->key_page_off && tailj < mb + m->size) die("%s: its patch tail overlaps %s's tail slot", m->name, g_mod[i].name);
+        }
+        uint8_t *b = g_group + mb;
+        uint64_t img = sz < m->group_copy_lim ? sz : m->group_copy_lim;   // the image and the zero gap: nothing of another module's image or tail is in there (group_reserve's limit)
+        memcpy(b, raw, img);
+        if (sz > m->key_page_off) memcpy(b + m->key_page_off, raw + m->key_page_off, sz - m->key_page_off);   // the tail: key page, frame-step page, patch area
+        free(raw);
+        m->base = b; install_key_page(m);
+        mods_code_apply(m, dir, names, nn);   // the Mods panel's exefs code layers, while the image is still writable
+        uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+        if (mprotect(b, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
+        uint64_t po = m->patch_off & ~0x3FFFull;
+        if (mprotect(b + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
+        mods_code_seal(m);   // mod-written pages stay RWX (dm/host/mods_code.c)
+        for (uint64_t p = mb / GROUP_PAGE; p < (mb + m->size + GROUP_PAGE - 1) / GROUP_PAGE; p++) g_group_map[p] = 1;   // the pages the module's file covers: group_seal leaves them to the per-module seals
+        return;
+    }
     if (m->patch_off < 0) {
         // Patch area before the base: file = the first part of the image (text + ro + data) + patch area; bss and the key page are anonymous zero pages. The gap from the patch area's end to the base is left inaccessible (PROT_NONE)
         uint64_t pre = (uint64_t)-m->patch_off, fl = m->file_image_len;
@@ -610,6 +686,9 @@ void load_modules(const char *dir, const char **names, int n) {
         read_layout(m, dir);
     }
     create_keys();
+#if !TARGET_OS_IPHONE
+    group_reserve(g_mod, n);   // a mod layout (the fixups' MOD_BASE rows): map the group once and compute each module's copy limit; a no-op for packs without it
+#endif
     for (int i = 0; i < n; i++) {
         module_t *m = &g_mod[i];
         t = now_ns(); map_image(m, dir, names, n); tm += now_ns() - t;   // On return the code area is already read-only+execute; from here on the loader only writes data
@@ -619,6 +698,9 @@ void load_modules(const char *dir, const char **names, int n) {
         LOG("%s: base %p size %#zx", names[i], m->base, m->size);
         m->loaded = 1; g_loaded[g_nloaded++] = m; g_nmod++;
     }
+#if !TARGET_OS_IPHONE
+    if (g_group) group_seal();   // after the last module: the group's uncovered pages go PROT_NONE
+#endif
     force_init();
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
