@@ -247,11 +247,19 @@ void mods_code_apply(module_t *m, const char *dir, const char **names, int nn) {
     const char *env = getenv("DM_CODE_MODS"); if (!env || !*env) return;
     load_protected(dir, m->name);
     char mods[2048]; snprintf(mods, sizeof mods, "%s", env);
+    // The Mods panel's row order is the priority order: the RomFS overlay serves the first folder that holds a file
+    // (hle_fs.c rom_overlay_path; front_android.c logs "(first wins)"), so the code layers apply last-first and the
+    // first folder's bytes win the same way
+    char *folder[64]; int n = 0;
     for (char *f = mods; *f; ) {
         char *c = strchr(f, ':'); if (c) *c = 0;
-        mods_folder(m, f, names, nn);
+        if (*f) {
+            if (n < (int)(sizeof folder / sizeof folder[0])) folder[n++] = f;
+            else LOG("[RED] [code] more than 64 code mods: the later, lower-priority ones are skipped");
+        }
         if (c) f = c + 1; else break;
     }
+    while (n--) mods_folder(m, folder[n], names, nn);
 }
 
 // loader.c map_image, after the text is sealed: mod-written pages stay RWX (DM_MODS_RWX=0 seals them like the rest)
